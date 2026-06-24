@@ -1,6 +1,7 @@
 import {
   Component,
   ChangeDetectionStrategy,
+  effect,
   inject,
   input,
   output,
@@ -23,6 +24,7 @@ import { AssistantIndicatorComponent } from '../assistant-indicator/assistant-in
 import { SessionCostBadgeComponent } from '../session-cost-badge/session-cost-badge.component';
 import { VoiceOverlayComponent } from '../voice-overlay';
 import { VoiceChatService } from '../../services/voice';
+import { ChatStateService } from '../../services/chat/chat-state.service';
 
 /**
  * Configuration options for ChatContainerComponent.
@@ -37,6 +39,10 @@ export interface ChatContainerConfig {
   allowCloseAssistant: boolean;
   /** Show file attachment controls in chat input */
   showFileControls: boolean;
+  /** Show voice mode toggle in chat input */
+  showVoiceControl: boolean;
+  /** Show settings/tools button in chat input */
+  showSettingsControl: boolean;
   /** Custom greeting message (overrides default) */
   customGreeting?: string;
   /** Enable embedded mode (flex layout, no fixed positioning) */
@@ -80,6 +86,21 @@ export class ChatContainerComponent {
   // Child component reference for scroll functionality
   private messageListComponent = viewChild(MessageListComponent);
 
+  private readonly chatState = inject(ChatStateService);
+
+  // Non-composer submit paths (e.g. an MCP App widget's ui/message) bump
+  // ChatStateService.scrollToLastUserTick to get the same "scroll the new
+  // user message to the top" affordance the composer triggers in
+  // onMessageSubmitted. Skip the initial 0 so we don't scroll on mount.
+  private readonly _scrollOnExternalSubmit = effect(() => {
+    const tick = this.chatState.scrollToLastUserTick();
+    if (tick === 0) return;
+    setTimeout(
+      () => this.messageListComponent()?.scrollToLastUserMessage(),
+      100,
+    );
+  });
+
   // Required inputs
   messages = input.required<Message[]>();
   sessionId = input<string | null>(null);
@@ -101,6 +122,8 @@ export class ChatContainerComponent {
     showEmptyState: true,
     allowCloseAssistant: true,
     showFileControls: true,
+    showVoiceControl: true,
+    showSettingsControl: true,
     embeddedMode: false,
     fullPageMode: false,
     ...this.config(),

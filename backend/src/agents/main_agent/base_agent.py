@@ -8,7 +8,7 @@ stream_async() for their specific agent type.
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
 
 from agents.main_agent.core import ModelConfig, SystemPromptBuilder, AgentFactory
 from agents.main_agent.session import SessionFactory
@@ -16,6 +16,7 @@ from agents.main_agent.session.hooks import (
     StopHook,
     OAuthConsentHook,
     MCPExternalApprovalHook,
+    ContextAttributionHook,
 )
 from agents.main_agent.tools import (
     create_default_registry,
@@ -24,6 +25,7 @@ from agents.main_agent.tools import (
 )
 from agents.main_agent.multimodal import PromptBuilder
 from agents.main_agent.streaming import StreamCoordinator
+from apis.shared.tools.scoped_ids import base_tool_id
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +60,7 @@ class BaseAgent(ABC):
         provider: Optional[str] = None,
         max_tokens: Optional[int] = None,
         inference_params: Optional[Dict[str, Any]] = None,
+        mantle_endpoint_path: Optional[str] = None,
         skip_persistence: bool = False,
         extra_tools: Optional[List[Any]] = None,
     ):
@@ -102,6 +105,7 @@ class BaseAgent(ABC):
             caching_enabled=caching_enabled,
             provider=provider,
             inference_params=resolved_params,
+            mantle_endpoint_path=mantle_endpoint_path,
         )
 
         # Frozen snapshot of agent-construction params, used when the turn
@@ -114,6 +118,7 @@ class BaseAgent(ABC):
             "provider": provider,
             "caching_enabled": caching_enabled,
             "inference_params": dict(resolved_params),
+            "mantle_endpoint_path": mantle_endpoint_path,
         }
 
         # Load retry configuration from environment variables
@@ -220,10 +225,22 @@ class BaseAgent(ABC):
             external_tool_ids = []
 
             async def check_tools():
+                # A scoped id (`base::tool`) selects one tool of an MCP server;
+                # the catalog only knows the base id, and the tool filter
+                # classifies by the base too (`base in _external_mcp_tools`), so
+                # look up and register the BASE id. Registering the raw scoped
+                # id would miss the catalog entirely (`get_tool` is an exact PK
+                # lookup) and never match the base-keyed classifier — leaving a
+                # per-tool external binding unclassified and never loaded.
+                seen: set[str] = set()
                 for tool_id in self.enabled_tools:
-                    tool = await repository.get_tool(tool_id)
+                    base = base_tool_id(tool_id)
+                    if base in seen:
+                        continue
+                    seen.add(base)
+                    tool = await repository.get_tool(base)
                     if tool and tool.protocol == "mcp_external":
-                        external_tool_ids.append(tool_id)
+                        external_tool_ids.append(base)
                 return external_tool_ids
 
             try:
@@ -273,6 +290,12 @@ class BaseAgent(ABC):
         # without a flag.
         hooks.append(self._build_mcp_external_approval_hook())
 
+        # Per-turn context-token attribution (system / tools / messages).
+        # Best-effort; computes the breakdown on BeforeModelCallEvent and
+        # stashes it on the agent for the stream coordinator to surface on the
+        # final metadata SSE event.
+        hooks.append(ContextAttributionHook())
+
         return hooks
 
     def _build_mcp_external_approval_hook(self) -> MCPExternalApprovalHook:
@@ -291,7 +314,24 @@ class BaseAgent(ABC):
                 return set()
             return integration.approval_names_for_client(selected_tool.mcp_client)
 
-        return MCPExternalApprovalHook(approval_names_lookup=approval_names_lookup)
+        # Tools dispatched indirectly (SkillAgent's skill_executor meta-tool)
+        # never present as MCPAgentTool, so approval_names_lookup can't gate
+        # them. Subclasses that fold tools provide a tool_use-based second
+        # chance — mirrors the OAuth consent hook's fold-aware lookup.
+        return MCPExternalApprovalHook(
+            approval_names_lookup=approval_names_lookup,
+            tool_use_approval_lookup=self._build_tool_use_approval_lookup(),
+        )
+
+    def _build_tool_use_approval_lookup(
+        self,
+    ) -> Optional[Callable[[dict], Optional[Any]]]:
+        """Approval-target resolution from a raw `tool_use` dict, for agents
+        that dispatch tools indirectly (SkillAgent's meta-tools). The base
+        agent has no such indirection, so the approval hook gets None and
+        relies on `approval_names_lookup` alone.
+        """
+        return None
 
     def _build_oauth_consent_hook(self) -> OAuthConsentHook:
         """Construct the OAuth consent hook with closures over the MCP
@@ -308,6 +348,11 @@ class BaseAgent(ABC):
             if not isinstance(selected_tool, MCPAgentTool):
                 return None
             return integration.provider_for_client(selected_tool.mcp_client)
+
+        # Tools dispatched indirectly (SkillAgent's skill_executor meta-tool)
+        # never present as MCPAgentTool, so provider_lookup can't gate them.
+        # Subclasses that fold tools provide a tool_use-based second chance.
+        tool_use_provider_lookup = self._build_tool_use_provider_lookup()
 
         async def scopes_lookup(provider_id: str) -> List[str]:
             from apis.shared.oauth.provider_repository import get_provider_repository
@@ -356,7 +401,46 @@ class BaseAgent(ABC):
             provider_type_lookup=provider_type_lookup,
             custom_parameters_lookup=custom_parameters_lookup,
             disconnected_lookup=disconnected_lookup,
+            tool_use_provider_lookup=tool_use_provider_lookup,
         )
+
+    def _build_tool_use_provider_lookup(self) -> Optional[Callable[[dict], Optional[str]]]:
+        """OAuth provider resolution from a raw `tool_use` dict, for agents
+        that dispatch tools indirectly (SkillAgent's meta-tools). The base
+        agent has no such indirection, so the consent hook gets None and
+        relies on `provider_lookup` alone.
+        """
+        return None
+
+    def _expand_gateway_tool_ids(self, gateway_tool_ids: List[str]) -> List[str]:
+        """Expand #419 catalog gateway tools into the gateway's runtime per-tool
+        ids (see `expand_gateway_tool_ids`), bridging the async catalog lookup
+        into this sync build path the same way `_register_external_mcp_tools`
+        does.
+        """
+        from apis.shared.tools.repository import get_tool_catalog_repository
+        from agents.main_agent.tools.gateway_integration import (
+            expand_gateway_tool_ids,
+        )
+
+        repo = get_tool_catalog_repository()
+
+        import asyncio
+
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    return executor.submit(
+                        asyncio.run, expand_gateway_tool_ids(gateway_tool_ids, repo)
+                    ).result()
+            return loop.run_until_complete(
+                expand_gateway_tool_ids(gateway_tool_ids, repo)
+            )
+        except RuntimeError:
+            return asyncio.run(expand_gateway_tool_ids(gateway_tool_ids, repo))
 
     def _build_filtered_tools(self) -> List:
         """
@@ -372,6 +456,10 @@ class BaseAgent(ABC):
 
         # Get gateway client and add to tools if available
         if gateway_tool_ids:
+            # #419 catalog tools (`gateway_<id>`) must be expanded to the
+            # gateway's runtime per-tool ids (`gateway_<target>___<tool>`)
+            # before the FilteredMCPClient can match them.
+            gateway_tool_ids = self._expand_gateway_tool_ids(gateway_tool_ids)
             gateway_client = self.gateway_integration.get_client(gateway_tool_ids)
             if gateway_client:
                 local_tools = self.gateway_integration.add_to_tool_list(local_tools)

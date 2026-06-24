@@ -6,7 +6,13 @@ Contains Pydantic models for chat API requests and responses.
 import json
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+
+# Hard upper bound on a user-supplied custom system prompt. Mirrors the
+# limit applied inside SystemPromptBuilder.from_user_prompt — surfacing
+# it at the API layer so oversized payloads are rejected before any
+# downstream work runs.
+MAX_USER_SYSTEM_PROMPT_CHARS = 8 * 1024
 
 
 class FileContent(BaseModel):
@@ -106,10 +112,27 @@ class InvocationRequest(BaseModel):
     # continues the truncated assistant message already in restored history
     # (assistant-prefill). Bypasses quota / RAG / file resolution like resume.
     continue_truncated: Optional[bool] = None
-    # Selects which agent factory variant builds the turn. Defaults to "chat"
-    # (MainAgent / ChatAgent) when omitted, so existing clients are unaffected.
-    # Pass "skill" to route through SkillAgent's progressive skill disclosure.
+    # Selects which agent factory variant builds the turn. When omitted, the
+    # server applies its default (PR-7: "skill" — admin-configurable via the
+    # chat-mode policy, see routes.py), routing through SkillAgent's progressive
+    # disclosure; a user with no granted skills degrades to plain ChatAgent
+    # behavior. Pass "chat" to opt out of the skill path for a turn — honored
+    # only while the admin policy allows mode toggling.
     agent_type: Optional[str] = None
+    # Per-turn selection of which accessible skills are active (skill agent
+    # path only). None/absent = all RBAC-accessible skills (back-compat with
+    # clients that predate the skills picker). A list is intersected
+    # server-side with the accessible set — client input can narrow the set,
+    # never grant. An empty (or fully inaccessible) list yields zero skills,
+    # so the SkillAgent degrades to plain chat behavior for the turn.
+    enabled_skills: Optional[List[str]] = None
+    # User-selected custom system prompt ("conversation mode") for this
+    # turn. The frontend forwards the active selection on every submit so
+    # the inference path doesn't have to round-trip session metadata to
+    # discover the choice — important on first-turn-of-a-new-session where
+    # no metadata row exists yet. The resolver also persists this id back
+    # to session preferences so the choice survives a refresh / new device.
+    selected_prompt_id: Optional[str] = None
     # When set, this invocation is an app-initiated tools/call proxied from
     # an embedded MCP App (PR #5). `message` is ignored; no model turn runs.
     app_tool_call: Optional[AppToolCallEntry] = None
@@ -118,6 +141,21 @@ class InvocationRequest(BaseModel):
     # `message` is ignored; no model turn runs. The context is merged into
     # (and cleared before) the next real user turn's prompt.
     app_context_update: Optional[AppContextUpdateEntry] = None
+
+    @field_validator("system_prompt")
+    @classmethod
+    def _bound_system_prompt_length(cls, value: Optional[str]) -> Optional[str]:
+        """Reject user-supplied system prompts larger than the configured cap.
+
+        The cap is also enforced inside ``SystemPromptBuilder.from_user_prompt``
+        as defense in depth. Surfacing it at the request boundary lets us
+        return a proper 4xx instead of silently truncating downstream.
+        """
+        if value is None:
+            return value
+        if len(value) > MAX_USER_SYSTEM_PROMPT_CHARS:
+            raise ValueError(f"system_prompt exceeds maximum length of {MAX_USER_SYSTEM_PROMPT_CHARS} characters")
+        return value
 
 
 class InvocationResponse(BaseModel):

@@ -34,6 +34,10 @@ export const adminRoutes: Routes = [
     loadComponent: () => import('./manage-models/manage-models.page').then(m => m.ManageModelsPage),
   },
   {
+    path: 'manage-models/catalog',
+    loadComponent: () => import('./manage-models/model-catalog.page').then(m => m.ModelCatalogPage),
+  },
+  {
     path: 'manage-models/new',
     loadComponent: () => import('./manage-models/model-form.page').then(m => m.ModelFormPage),
   },
@@ -64,6 +68,18 @@ export const adminRoutes: Routes = [
   {
     path: 'tools/edit/:toolId',
     loadComponent: () => import('./tools/pages/tool-form.page').then(m => m.ToolFormPage),
+  },
+  {
+    path: 'skills',
+    loadComponent: () => import('./skills/pages/skill-list.page').then(m => m.SkillListPage),
+  },
+  {
+    path: 'skills/new',
+    loadComponent: () => import('./skills/pages/skill-form.page').then(m => m.SkillFormPage),
+  },
+  {
+    path: 'skills/edit/:skillId',
+    loadComponent: () => import('./skills/pages/skill-form.page').then(m => m.SkillFormPage),
   },
   {
     path: 'connectors',
@@ -135,5 +151,17 @@ export const adminRoutes: Routes = [
   {
     path: 'manage-user-menu-links/edit/:id',
     loadComponent: () => import('./manage-user-menu-links/user-menu-link-form.page').then(m => m.UserMenuLinkFormPage),
+  },
+  {
+    path: 'system-prompts',
+    loadComponent: () => import('./system-prompts/manage-system-prompts.page').then(m => m.ManageSystemPromptsPage),
+  },
+  {
+    path: 'system-prompts/new',
+    loadComponent: () => import('./system-prompts/system-prompt-form.page').then(m => m.SystemPromptFormPage),
+  },
+  {
+    path: 'system-prompts/edit/:promptId',
+    loadComponent: () => import('./system-prompts/system-prompt-form.page').then(m => m.SystemPromptFormPage),
   },
 ];

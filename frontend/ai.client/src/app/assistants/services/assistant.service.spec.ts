@@ -1,5 +1,6 @@
 import { TestBed } from '@angular/core/testing';
-import { HttpClientTestingModule, HttpTestingController } from '@angular/common/http/testing';
+import { HttpTestingController, provideHttpClientTesting } from '@angular/common/http/testing';
+import { provideHttpClient } from '@angular/common/http';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { AssistantService } from './assistant.service';
 import { AssistantApiService } from './assistant-api.service';
@@ -22,12 +23,14 @@ describe('AssistantService', () => {
       getAssistant: vi.fn(),
       shareAssistant: vi.fn(),
       unshareAssistant: vi.fn(),
+      updateSharePermission: vi.fn(),
       getAssistantShares: vi.fn()
     };
 
     TestBed.configureTestingModule({
-      imports: [HttpClientTestingModule],
       providers: [
+        provideHttpClient(),
+        provideHttpClientTesting(),
         AssistantService,
         { provide: AssistantApiService, useValue: mockApiService }
       ]
@@ -92,14 +95,29 @@ describe('AssistantService', () => {
     expect(service.assistants$()).toContain(mockAssistant);
   });
 
-  it('should share assistant', async () => {
-    const mockResponse = { sharedWith: ['user1@example.com'] };
+  it('should share assistant with default viewer permission', async () => {
+    const mockResponse = { sharedWith: [{ email: 'user1@example.com', permission: 'viewer' }] };
     mockApiService.shareAssistant.mockReturnValue(of(mockResponse));
 
     const result = await service.shareAssistant('1', ['user1@example.com']);
 
-    expect(mockApiService.shareAssistant).toHaveBeenCalledWith('1', { emails: ['user1@example.com'] });
+    expect(mockApiService.shareAssistant).toHaveBeenCalledWith('1', {
+      emails: ['user1@example.com'],
+      permission: 'viewer',
+    });
     expect(result).toEqual(mockResponse);
+  });
+
+  it('should share assistant with editor permission when supplied', async () => {
+    const mockResponse = { sharedWith: [{ email: 'user1@example.com', permission: 'editor' }] };
+    mockApiService.shareAssistant.mockReturnValue(of(mockResponse));
+
+    await service.shareAssistant('1', ['user1@example.com'], 'editor');
+
+    expect(mockApiService.shareAssistant).toHaveBeenCalledWith('1', {
+      emails: ['user1@example.com'],
+      permission: 'editor',
+    });
   });
 
   it('should unshare assistant', async () => {
@@ -112,13 +130,29 @@ describe('AssistantService', () => {
     expect(result).toEqual(mockResponse);
   });
 
-  it('should get assistant shares', async () => {
-    const mockResponse = { sharedWith: ['user1@example.com', 'user2@example.com'] };
-    mockApiService.getAssistantShares.mockReturnValue(of(mockResponse));
+  it('should update share permission on an existing share', async () => {
+    const mockResponse = { sharedWith: [{ email: 'user1@example.com', permission: 'editor' }] };
+    mockApiService.updateSharePermission.mockReturnValue(of(mockResponse));
+
+    const result = await service.updateSharePermission('1', 'user1@example.com', 'editor');
+
+    expect(mockApiService.updateSharePermission).toHaveBeenCalledWith('1', {
+      email: 'user1@example.com',
+      permission: 'editor',
+    });
+    expect(result).toEqual(mockResponse);
+  });
+
+  it('should get assistant shares as ShareEntry[]', async () => {
+    const entries = [
+      { email: 'user1@example.com', permission: 'viewer' },
+      { email: 'user2@example.com', permission: 'editor' },
+    ];
+    mockApiService.getAssistantShares.mockReturnValue(of({ sharedWith: entries }));
 
     const result = await service.getAssistantShares('1');
 
     expect(mockApiService.getAssistantShares).toHaveBeenCalledWith('1');
-    expect(result).toEqual(['user1@example.com', 'user2@example.com']);
+    expect(result).toEqual(entries);
   });
 });

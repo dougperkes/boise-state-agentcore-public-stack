@@ -98,16 +98,19 @@ class TestExplicitProviderOverride:
 class TestToBedrockConfig:
     """Validates: Requirements 1.6, 1.7"""
 
-    def test_bedrock_config_with_caching_enabled_currently_omits_cache_config(self):
-        """Req 1.6 — caching_enabled=True but cache_config omitted while
-        Bedrock prompt caching rollout is deferred. The SDK-side blocker is
-        resolved in strands 1.39.0; see model_config.py for the deferral note."""
+    def test_bedrock_config_with_caching_enabled_sets_auto_cache_config(self):
+        """Req 1.6 — caching_enabled=True emits a CacheConfig(strategy="auto").
+        Strands places cache points per-model and no-ops with a warning for
+        models that don't support automatic caching."""
+        from strands.models import CacheConfig
+
         cfg = ModelConfig(caching_enabled=True)
         result = cfg.to_bedrock_config()
 
         assert result["model_id"] == cfg.model_id
         assert "temperature" not in result  # No default temperature emitted
-        assert "cache_config" not in result
+        assert isinstance(result["cache_config"], CacheConfig)
+        assert result["cache_config"].strategy == "auto"
 
     def test_bedrock_config_without_caching(self):
         """Req 1.6 (negative) — caching disabled → no cache_config key."""
@@ -116,6 +119,24 @@ class TestToBedrockConfig:
 
         assert result["model_id"] == cfg.model_id
         assert "cache_config" not in result
+
+    def test_bedrock_config_enables_native_token_count(self):
+        """Native Bedrock CountTokens is enabled on the Bedrock path so
+        projected_input_tokens / count_tokens() return authoritative counts
+        instead of the chars/4 heuristic — the foundation for per-turn context
+        attribution. The runtime-role IAM grant landed in #428. Set
+        unconditionally (Strands falls back + caches the skip if a model can't
+        count), so it holds regardless of caching or inference params."""
+        assert ModelConfig().to_bedrock_config()["use_native_token_count"] is True
+        assert (
+            ModelConfig(caching_enabled=True).to_bedrock_config()["use_native_token_count"]
+            is True
+        )
+        assert (
+            ModelConfig(inference_params={"temperature": 0.4})
+            .to_bedrock_config()["use_native_token_count"]
+            is True
+        )
 
     def test_bedrock_config_emits_temperature_only_when_set(self):
         """Inference params only ride along when explicitly configured."""
@@ -176,7 +197,11 @@ class TestToBedrockConfig:
         )
         result = cfg.to_bedrock_config()
 
-        assert "additional_request_fields" not in result
+        # No thinking config is added when thinking is disabled. (Claude models
+        # may still carry `additional_request_fields.anthropic_beta` for
+        # fine-grained tool streaming — see the dedicated tests below — so we
+        # assert thinking absence specifically rather than the whole key.)
+        assert "thinking" not in result.get("additional_request_fields", {})
         assert result["temperature"] == 0.5
         assert result["top_p"] == 0.8
 
@@ -304,6 +329,51 @@ class TestToBedrockConfig:
 
         assert "boto_client_config" not in result
 
+    # -- MCP Apps (SEP-1865) fine-grained tool streaming ---------------------
+
+    _FGTS_BETA = "fine-grained-tool-streaming-2025-05-14"
+
+    def test_bedrock_config_adds_fine_grained_tool_streaming_for_claude(self, monkeypatch):
+        """Claude model + MCP Apps host on → fine-grained tool streaming beta
+        is added so Bedrock streams tool input incrementally (not buffered)."""
+        monkeypatch.setenv("AGENTCORE_MCP_APPS_HOST_ENABLED", "true")
+        cfg = ModelConfig(model_id="us.anthropic.claude-haiku-4-5-20251001-v1:0")
+        result = cfg.to_bedrock_config()
+
+        assert result["additional_request_fields"]["anthropic_beta"] == [self._FGTS_BETA]
+
+    def test_bedrock_config_no_fine_grained_streaming_when_mcp_apps_disabled(self, monkeypatch):
+        """MCP Apps host off → the beta is not added (opted-out environments
+        keep Anthropic's default JSON-validated tool input)."""
+        monkeypatch.setenv("AGENTCORE_MCP_APPS_HOST_ENABLED", "false")
+        cfg = ModelConfig(model_id="us.anthropic.claude-haiku-4-5-20251001-v1:0")
+        result = cfg.to_bedrock_config()
+
+        assert "anthropic_beta" not in result.get("additional_request_fields", {})
+
+    def test_bedrock_config_no_fine_grained_streaming_for_non_claude(self, monkeypatch):
+        """Non-Claude Bedrock model → the Anthropic-only beta is never added
+        (would be rejected by other providers' models)."""
+        monkeypatch.setenv("AGENTCORE_MCP_APPS_HOST_ENABLED", "true")
+        cfg = ModelConfig(model_id="us.amazon.nova-pro-v1:0")
+        result = cfg.to_bedrock_config()
+
+        assert "anthropic_beta" not in result.get("additional_request_fields", {})
+
+    def test_bedrock_config_fine_grained_streaming_merges_with_thinking(self, monkeypatch):
+        """The beta is added alongside an existing `additional_request_fields`
+        block (e.g. thinking) rather than clobbering it."""
+        monkeypatch.setenv("AGENTCORE_MCP_APPS_HOST_ENABLED", "true")
+        cfg = ModelConfig(
+            model_id="us.anthropic.claude-sonnet-4-6",
+            inference_params={"thinking": 2048, "max_tokens": 8192},
+        )
+        result = cfg.to_bedrock_config()
+
+        arf = result["additional_request_fields"]
+        assert arf["anthropic_beta"] == [self._FGTS_BETA]
+        assert "thinking" in arf
+
 
 # ---------------------------------------------------------------------------
 # Req 1.8–1.9 — to_openai_config / to_gemini_config
@@ -338,6 +408,55 @@ class TestToOpenAIConfig:
         result = cfg.to_openai_config()
 
         assert "params" not in result
+
+
+class TestToMantleConfig:
+    """Bedrock Mantle — OpenAI-wire-compatible config translation."""
+
+    def test_mantle_config_basic(self):
+        cfg = ModelConfig(
+            model_id="openai.gpt-oss-120b",
+            provider=ModelProvider.MANTLE,
+            inference_params={"temperature": 0.5},
+        )
+        result = cfg.to_mantle_config()
+
+        assert result["model_id"] == "openai.gpt-oss-120b"
+        assert result["params"]["temperature"] == 0.5
+
+    def test_mantle_config_without_inference_params_omits_params_block(self):
+        cfg = ModelConfig(
+            model_id="qwen.qwen3-coder-30b-a3b-instruct",
+            provider=ModelProvider.MANTLE,
+        )
+        result = cfg.to_mantle_config()
+
+        assert "params" not in result
+
+    def test_mantle_config_drops_top_k(self):
+        """OpenAI wire protocol has no top_k — translation drops it silently."""
+        cfg = ModelConfig(
+            model_id="openai.gpt-oss-120b",
+            provider=ModelProvider.MANTLE,
+            inference_params={"top_k": 40},
+        )
+        result = cfg.to_mantle_config()
+
+        assert "params" not in result
+
+    def test_explicit_mantle_provider_wins_over_auto_detect(self):
+        """Mantle is never auto-detected; explicit provider must stick even
+        for ids that look like other providers' (e.g. `openai.` prefix)."""
+        cfg = ModelConfig(model_id="openai.gpt-oss-120b", provider=ModelProvider.MANTLE)
+
+        assert cfg.get_provider() == ModelProvider.MANTLE
+
+    def test_from_params_accepts_mantle(self):
+        cfg = ModelConfig.from_params(
+            model_id="qwen.qwen3-coder-30b-a3b-instruct", provider="mantle"
+        )
+
+        assert cfg.get_provider() == ModelProvider.MANTLE
 
 
 class TestToGeminiConfig:
@@ -384,6 +503,7 @@ class TestToDict:
             "caching_enabled",
             "provider",
             "inference_params",
+            "mantle_endpoint_path",
         }
 
 

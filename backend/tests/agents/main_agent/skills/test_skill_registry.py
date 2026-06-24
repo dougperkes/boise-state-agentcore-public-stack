@@ -1,5 +1,7 @@
 """Tests for SkillRegistry — discovery, binding, and three-level access."""
 
+from types import SimpleNamespace
+
 import pytest
 from agents.main_agent.skills.skill_registry import SkillRegistry
 
@@ -139,3 +141,184 @@ class TestTools:
         schemas = registry.get_tool_schemas("web-search")
         assert len(schemas) == 1
         assert schemas[0]["name"] == "web_search"
+
+
+class _Rec:
+    """Minimal SkillDefinition stand-in (duck-typed by load_records)."""
+
+    def __init__(self, skill_id, description="", instructions="", compose=None,
+                 bound_tool_ids=None, resources=None, status="active"):
+        self.skill_id = skill_id
+        self.description = description
+        self.instructions = instructions
+        self.compose = compose or []
+        self.bound_tool_ids = bound_tool_ids or []
+        self.resources = resources or []
+        self.status = status
+
+
+class TestDbSource:
+    """Req SK-6 (PR-6): DynamoDB-backed skill records (admin-managed)."""
+
+    def test_load_records_populates_registry(self):
+        reg = SkillRegistry()
+        n = reg.load_records([
+            _Rec("pdf_workflows", description="PDFs", instructions="# PDF body",
+                 bound_tool_ids=["fill_pdf_form"]),
+            _Rec("doc_basics", description="Docs"),
+        ])
+        assert n == 2
+        assert reg.get_skill_count() == 2
+        assert reg.has_skill("pdf_workflows")
+        # Catalog lists the DB skills by skill_id + description.
+        catalog = reg.get_catalog()
+        assert "pdf_workflows" in catalog and "PDFs" in catalog
+
+    def test_load_instructions_returns_inline_body(self):
+        reg = SkillRegistry()
+        reg.load_records([_Rec("pdf_workflows", instructions="# Inline body")])
+        # DB mode: instructions come from the record, not a file.
+        assert reg.load_instructions("pdf_workflows") == "# Inline body"
+
+    def test_all_bound_tool_ids_unions_and_dedupes(self):
+        reg = SkillRegistry()
+        reg.load_records([
+            _Rec("a", bound_tool_ids=["t1", "t2"]),
+            _Rec("b", bound_tool_ids=["t2", "t3"]),
+        ])
+        assert sorted(reg.all_bound_tool_ids()) == ["t1", "t2", "t3"]
+
+    def test_bind_catalog_tools_binds_matching_ids_only(self):
+        reg = SkillRegistry()
+        reg.load_records([_Rec("a", bound_tool_ids=["local_tool", "gateway_x"])])
+
+        def local_tool():
+            return "ok"
+        local_tool.tool_name = "local_tool"
+
+        # Only the resolvable (local) id is in the map; the gateway id is not.
+        reg.bind_catalog_tools({"local_tool": local_tool})
+        tools = reg.get_tools("a")
+        assert tools == [local_tool]
+        # Schema reflects the bound local tool.
+        assert reg.get_tool_schemas("a")[0]["name"] == "local_tool"
+
+    def test_bind_catalog_tools_is_idempotent(self):
+        reg = SkillRegistry()
+        reg.load_records([_Rec("a", bound_tool_ids=["t"])])
+
+        def t():
+            return 1
+        t.tool_name = "t"
+
+        reg.bind_catalog_tools({"t": t})
+        reg.bind_catalog_tools({"t": t})
+        assert reg.get_tools("a") == [t]  # not double-bound
+
+    def test_db_composite_aggregates_child_tools(self):
+        reg = SkillRegistry()
+        reg.load_records([
+            _Rec("child", bound_tool_ids=["t"]),
+            _Rec("parent", compose=["child"]),
+        ])
+
+        def t():
+            return 1
+        t.tool_name = "t"
+
+        reg.bind_catalog_tools({"t": t})
+        assert reg.get_tools("parent") == [t]
+
+    def test_bind_catalog_tools_accepts_list_value(self):
+        # One catalog id can expand to several runtime tools (gateway target /
+        # external server with many) — bind_catalog_tools accepts a list.
+        reg = SkillRegistry()
+        reg.load_records([_Rec("a", bound_tool_ids=["server"])])
+
+        t1 = SimpleNamespace(tool_name="search")
+        t2 = SimpleNamespace(tool_name="fetch")
+        reg.bind_catalog_tools({"server": [t1, t2]})
+
+        tools = reg.get_tools("a")
+        assert tools == [t1, t2]
+
+    def test_bind_catalog_tools_list_is_idempotent(self):
+        reg = SkillRegistry()
+        reg.load_records([_Rec("a", bound_tool_ids=["server"])])
+        t1 = SimpleNamespace(tool_name="search")
+        reg.bind_catalog_tools({"server": [t1]})
+        reg.bind_catalog_tools({"server": [t1]})
+        assert reg.get_tools("a") == [t1]
+
+
+def _ref(filename, s3_key="k", content_type="text/markdown", size=10):
+    return {
+        "filename": filename,
+        "s3_key": s3_key,
+        "content_type": content_type,
+        "size": size,
+    }
+
+
+class _FakeStore:
+    """Stand-in for SkillResourceStore keyed by s3_key."""
+
+    def __init__(self, data):
+        self._data = data
+
+    def get(self, s3_key):
+        if s3_key not in self._data:
+            from apis.shared.skills.resource_store import SkillResourceStoreError
+
+            raise SkillResourceStoreError(f"missing {s3_key}")
+        return self._data[s3_key]
+
+
+class TestReferenceFiles:
+    """Req (PR-6b): reference-file progressive disclosure level."""
+
+    def test_get_resource_names(self):
+        reg = SkillRegistry()
+        reg.load_records([
+            _Rec("a", resources=[_ref("forms.md", "k1"), _ref("reference.md", "k2")])
+        ])
+        assert reg.get_resource_names("a") == ["forms.md", "reference.md"]
+
+    def test_get_resource_names_empty_when_none(self):
+        reg = SkillRegistry()
+        reg.load_records([_Rec("a")])
+        assert reg.get_resource_names("a") == []
+
+    def test_read_resource_returns_text(self):
+        reg = SkillRegistry()
+        reg.load_records([_Rec("a", resources=[_ref("forms.md", "k1")])])
+        store = _FakeStore({"k1": b"# Forms\nfill them in"})
+        out = reg.read_resource("a", "forms.md", store=store)
+        assert out["content"] == "# Forms\nfill them in"
+        assert out["filename"] == "forms.md"
+
+    def test_read_resource_unknown_skill_returns_none(self):
+        reg = SkillRegistry()
+        assert reg.read_resource("nope", "x.md", store=_FakeStore({})) is None
+
+    def test_read_resource_missing_file_errors(self):
+        reg = SkillRegistry()
+        reg.load_records([_Rec("a", resources=[_ref("forms.md", "k1")])])
+        out = reg.read_resource("a", "absent.md", store=_FakeStore({}))
+        assert "error" in out
+
+    def test_read_resource_storage_error_is_error_dict(self):
+        reg = SkillRegistry()
+        reg.load_records([_Rec("a", resources=[_ref("forms.md", "k1")])])
+        # Store has no k1 → raises SkillResourceStoreError → error dict.
+        out = reg.read_resource("a", "forms.md", store=_FakeStore({}))
+        assert "error" in out
+
+    def test_read_resource_binary_is_noted_not_dumped(self):
+        reg = SkillRegistry()
+        reg.load_records([_Rec("a", resources=[_ref("logo.png", "k1", "image/png")])])
+        store = _FakeStore({"k1": b"\x89PNG\x00\xff"})
+        out = reg.read_resource("a", "logo.png", store=store)
+        assert "content" not in out
+        assert "note" in out
+        assert out["content_type"] == "image/png"

@@ -68,10 +68,13 @@ class TestDetectAwsServiceFromUrl:
         url = "https://gateway-abc.bedrock-agentcore.us-west-2.amazonaws.com/mcp"
         assert detect_aws_service_from_url(url) == "bedrock-agentcore"
 
-    def test_defaults_to_lambda_for_unknown_url(self):
-        """Req 25.3: Defaults to 'lambda' for unrecognized URL patterns."""
+    def test_returns_none_for_unknown_url(self):
+        """Req 25.3: Returns None for any URL that isn't a recognized AWS
+        service hostname. Callers wiring SigV4 must treat None as a refusal
+        — issuing a SigV4 request to an arbitrary host would attach IAM
+        credentials to a request the destination has no business seeing."""
         url = "https://example.com/api/v1"
-        assert detect_aws_service_from_url(url) == "lambda"
+        assert detect_aws_service_from_url(url) is None
 
 
 class TestProviderForClient:
@@ -306,3 +309,140 @@ class TestLoadExternalToolsPreflight:
 
         assert result == [good_client]
         assert integration.clients == {"gmail": good_client}
+
+
+class TestLoadExternalToolsScoped:
+    """Per-tool enablement: a scoped id (`base::tool`) restricts the client to
+    the selected tool names; a bare id exposes the whole server."""
+
+    @pytest.mark.asyncio
+    async def test_scoped_ids_collapse_to_one_filtered_client(self):
+        integration = ExternalMCPIntegration()
+        tool = _fake_tool(datetime(2025, 1, 1, tzinfo=timezone.utc))
+        repo = SimpleNamespace(get_tool=AsyncMock(return_value=tool))
+        client = SimpleNamespace(load_tools=AsyncMock(return_value=[]))
+
+        with patch(
+            "apis.shared.tools.repository.get_tool_catalog_repository",
+            return_value=repo,
+        ), patch(
+            "agents.main_agent.integrations.external_mcp_client.create_external_mcp_client",
+            return_value=client,
+        ) as create_mock:
+            await integration.load_external_tools(["gmail::send", "gmail::search"])
+
+        # Two scoped ids for one server build a single client, restricted to
+        # the selected tool names.
+        assert create_mock.call_count == 1
+        assert create_mock.call_args.kwargs["allowed_tool_names"] == {"send", "search"}
+
+    @pytest.mark.asyncio
+    async def test_bare_id_exposes_whole_server(self):
+        integration = ExternalMCPIntegration()
+        tool = _fake_tool(datetime(2025, 1, 1, tzinfo=timezone.utc))
+        repo = SimpleNamespace(get_tool=AsyncMock(return_value=tool))
+        client = SimpleNamespace(load_tools=AsyncMock(return_value=[]))
+
+        with patch(
+            "apis.shared.tools.repository.get_tool_catalog_repository",
+            return_value=repo,
+        ), patch(
+            "agents.main_agent.integrations.external_mcp_client.create_external_mcp_client",
+            return_value=client,
+        ) as create_mock:
+            await integration.load_external_tools(["gmail"])
+
+        assert create_mock.call_args.kwargs["allowed_tool_names"] is None
+
+    @pytest.mark.asyncio
+    async def test_different_subsets_are_distinct_cached_clients(self):
+        integration = ExternalMCPIntegration()
+        tool = _fake_tool(datetime(2025, 1, 1, tzinfo=timezone.utc))
+        repo = SimpleNamespace(get_tool=AsyncMock(return_value=tool))
+        client_a = SimpleNamespace(load_tools=AsyncMock(return_value=[]))
+        client_b = SimpleNamespace(load_tools=AsyncMock(return_value=[]))
+
+        with patch(
+            "apis.shared.tools.repository.get_tool_catalog_repository",
+            return_value=repo,
+        ), patch(
+            "agents.main_agent.integrations.external_mcp_client.create_external_mcp_client",
+            side_effect=[client_a, client_b],
+        ):
+            first = await integration.load_external_tools(["gmail::send"])
+            second = await integration.load_external_tools(["gmail::search"])
+
+        # A different selected-tool subset must not reuse the other's client.
+        assert first == [client_a]
+        assert second == [client_b]
+        assert len(integration.clients) == 2
+
+
+class TestGetClientResolvesScopedBindings:
+    """`get_client` must map a (possibly-scoped) catalog id back to the client
+    `load_external_tools` cached, including the per-tool `|allow:` cache-key
+    suffix a subset binding produces. Regression: a skill binding a *subset*
+    of an external MCP server (scoped ids like `canvas::courses`) resolved to
+    no client at fold time, so the skill folded zero tools and the model
+    reported the server "not connected"."""
+
+    @staticmethod
+    def _oauth_tool(tool_id="canvas"):
+        return SimpleNamespace(
+            tool_id=tool_id,
+            protocol="mcp_external",
+            mcp_config=SimpleNamespace(
+                server_url="https://example.com/mcp",
+                approval_required_names=lambda: set(),
+            ),
+            forward_auth_token=False,
+            requires_oauth_provider="canvas-oauth",
+            updated_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
+        )
+
+    @pytest.mark.asyncio
+    async def test_resolves_scoped_oauth_binding_round_trip(self):
+        integration = ExternalMCPIntegration()
+        client = SimpleNamespace(load_tools=AsyncMock(return_value=[]))
+        repo = SimpleNamespace(get_tool=AsyncMock(return_value=self._oauth_tool()))
+
+        with patch(
+            "apis.shared.tools.repository.get_tool_catalog_repository",
+            return_value=repo,
+        ), patch(
+            "agents.main_agent.integrations.external_mcp_client.create_external_mcp_client",
+            return_value=client,
+        ):
+            await integration.load_external_tools(
+                ["canvas::courses", "canvas::submissions"], user_id="alice"
+            )
+
+        # Cached under "alice:canvas|allow:courses,submissions"; the skill folds
+        # by the scoped id (or the base) — every form must find that client.
+        assert integration.get_client("canvas::courses", "alice") is client
+        assert integration.get_client("canvas::submissions", "alice") is client
+        assert integration.get_client("canvas", "alice") is client
+
+    @pytest.mark.asyncio
+    async def test_whole_server_binding_still_resolves(self):
+        integration = ExternalMCPIntegration()
+        client = SimpleNamespace(load_tools=AsyncMock(return_value=[]))
+        repo = SimpleNamespace(get_tool=AsyncMock(return_value=self._oauth_tool()))
+
+        with patch(
+            "apis.shared.tools.repository.get_tool_catalog_repository",
+            return_value=repo,
+        ), patch(
+            "agents.main_agent.integrations.external_mcp_client.create_external_mcp_client",
+            return_value=client,
+        ):
+            await integration.load_external_tools(["canvas"], user_id="alice")
+
+        # Exact whole-server key resolves, and a scoped lookup against it does too.
+        assert integration.get_client("canvas", "alice") is client
+        assert integration.get_client("canvas::courses", "alice") is client
+
+    def test_missing_returns_none(self):
+        integration = ExternalMCPIntegration()
+        assert integration.get_client("canvas::courses", "alice") is None
+        assert integration.get_client("canvas") is None

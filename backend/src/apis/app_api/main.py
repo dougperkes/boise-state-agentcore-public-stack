@@ -108,6 +108,18 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# Centralized exception handlers: AWS ClientError responses are mapped to
+# generic 400/502 bodies (logged server-side) so AWS error messages, internal
+# parameter names, and reflected user input never leak into HTTP responses.
+from apis.shared.security import (
+    register_aws_client_error_handler,
+    register_validation_error_handler,
+)
+from apis.shared.feature_flags import skills_enabled
+register_aws_client_error_handler(app)
+register_validation_error_handler(app)
+logger.info("Registered AWS ClientError handler")
+
 # Add CORS middleware - origins from CDK-provided CORS_ORIGINS env var
 # NOTE: `allow_credentials=True` is required for the BFF cookie flow when the
 # SPA and BFF are cross-origin (e.g. local dev: SPA on :4200, BFF on :8000).
@@ -179,10 +191,13 @@ from apis.app_api.documents.routes import router as documents_router
 from apis.app_api.users.routes import router as users_router
 from apis.app_api.user_settings.routes import router as user_settings_router
 from apis.app_api.connectors.routes import router as connectors_router
+from apis.app_api.file_sources.routes import router as file_sources_router
+from apis.app_api.web_sources.routes import router as web_sources_router
 from apis.app_api.system.routes import router as system_router
 from apis.app_api.shares.routes import conversations_share_router, shares_router, shared_view_router
 from apis.app_api.voice import router as voice_router
 from apis.app_api.user_menu_links.routes import router as user_menu_links_router
+from apis.app_api.system_prompts.routes import router as system_prompts_router
 
 # Include routers
 app.include_router(health_router)
@@ -205,18 +220,28 @@ app.include_router(memory_router)  # AgentCore Memory access endpoints
 app.include_router(tools_router)  # Tool discovery and permissions
 app.include_router(files_router)  # File upload via pre-signed URLs
 app.include_router(connectors_router)  # User-facing connector catalog + consent flows
+app.include_router(file_sources_router)  # File-source catalog + browse/search over connectors
+app.include_router(web_sources_router)  # Web-crawl ingestion: URL -> documents via BFS + S3 staging
 app.include_router(system_router)  # System status and first-boot endpoints
 app.include_router(conversations_share_router)  # Share conversations endpoints
 app.include_router(shares_router)  # Share management (update, revoke, export)
 app.include_router(shared_view_router)  # Shared conversation read-only view
 app.include_router(voice_router)  # Cookie-authenticated WS proxy for Nova Sonic voice mode (#211)
 app.include_router(user_menu_links_router)  # Public read of admin-managed user-menu links
+app.include_router(system_prompts_router)   # Public read of admin-managed system prompts
 
 # Conditionally register fine-tuning routes
 if os.environ.get("FINE_TUNING_ENABLED", "false").lower() == "true":
     from apis.app_api.fine_tuning.routes import router as fine_tuning_router
     app.include_router(fine_tuning_router)
     logger.info("Fine-tuning routes enabled")
+
+# Conditionally register the user-facing skills surface (skill list +
+# per-skill preferences). Deferred to a later release; off by default.
+if skills_enabled():
+    from apis.app_api.skills.routes import router as user_skills_router
+    app.include_router(user_skills_router)
+    logger.info("Skills routes enabled")
 
 # Conditionally register artifact render-token routes. Infra only sets
 # the secret ARN when the artifacts feature is enabled for the

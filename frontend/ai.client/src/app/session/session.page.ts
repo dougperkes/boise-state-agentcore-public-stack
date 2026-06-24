@@ -30,6 +30,8 @@ import {
   ShareAssistantDialogData,
 } from '../assistants/components/share-assistant-dialog.component';
 import { VoiceChatService } from './services/voice';
+import { SystemPromptsService } from '../services/system-prompts/system-prompts.service';
+import { ChatModeService } from '../services/chat-mode/chat-mode.service';
 
 @Component({
   selector: 'app-session-page',
@@ -60,6 +62,8 @@ export class ConversationPage implements OnDestroy {
   private router = inject(Router);
   private dialog = inject(Dialog);
   private voiceChatService = inject(VoiceChatService);
+  private systemPromptsService = inject(SystemPromptsService);
+  private chatModeService = inject(ChatModeService);
 
   sessionId = signal<string | null>(null);
   assistantIdFromQuery = signal<string | null>(null);
@@ -183,6 +187,37 @@ export class ConversationPage implements OnDestroy {
       if (session?.preferences?.lastModel) {
         this.modelService.setSelectedModelById(session.preferences.lastModel);
       }
+    });
+
+    // Restore the agent mode (skills vs. tools) this conversation was using.
+    // Sessions without a stored mode (new or pre-feature) are ignored so the
+    // current selection carries into the first message of a new conversation.
+    effect(() => {
+      const session = this.sessionConversation();
+      this.chatModeService.hydrateFromSession(session?.preferences?.agentType);
+    });
+
+    // Hydrate active system prompt from session preferences. We treat the
+    // sessionId itself as the trigger so that switching from Session A to a
+    // brand-new Session B (whose metadata hasn't loaded yet) resets the
+    // chip rather than leaking A's selection into B.
+    //
+    // The service tracks which session a local selection is bound to, so
+    // a freshly-claimed home-page selection isn't wiped when the new
+    // session's metadata arrives without preferences yet.
+    effect(() => {
+      const id = this.sessionId();
+      const session = this.sessionConversation();
+
+      if (!id || session?.sessionId !== id) {
+        this.systemPromptsService.hydrateFromSession(id, null);
+        return;
+      }
+
+      this.systemPromptsService.hydrateFromSession(
+        id,
+        session?.preferences?.selectedPromptId ?? null
+      );
     });
 
     // Seed the session cost + context aggregates from session metadata so
@@ -315,8 +350,10 @@ export class ConversationPage implements OnDestroy {
       this.artifactState.reset();
 
       // MCP App frames persist for the conversation's lifetime per the
-      // scoping doc; teardown is on conversation change. No re-hydration:
-      // the inline `ui_resource` event only arrives live during a stream.
+      // scoping doc; teardown is on conversation change. Clear before the
+      // next load — loadMessagesForSession re-seeds from the persisted
+      // `uiResources` sidecar on the messages response so frames survive a
+      // refresh (the inline `ui_resource` event itself only arrives live).
       this.mcpAppState.reset();
 
       // Option A (PR #6): app-initiated tool cards DO re-hydrate (the

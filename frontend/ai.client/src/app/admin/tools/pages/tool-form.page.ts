@@ -8,6 +8,7 @@ import {
   effect,
 } from '@angular/core';
 import { Router, ActivatedRoute, RouterLink } from '@angular/router';
+import { HttpErrorResponse } from '@angular/common/http';
 import { FormArray, FormBuilder, FormGroup, Validators, ReactiveFormsModule } from '@angular/forms';
 import { NgIcon, provideIcons } from '@ng-icons/core';
 import {
@@ -18,6 +19,7 @@ import {
   heroShieldCheck,
   heroPlus,
   heroTrash,
+  heroExclamationTriangle,
 } from '@ng-icons/heroicons/outline';
 import { AdminToolService } from '../services/admin-tool.service';
 import { ConnectorsService } from '../../connectors/services/connectors.service';
@@ -28,17 +30,23 @@ import {
   MCP_TRANSPORTS,
   MCP_AUTH_TYPES,
   A2A_AUTH_TYPES,
+  GATEWAY_LISTING_MODES,
+  GATEWAY_CREDENTIAL_TYPES,
+  GATEWAY_OAUTH_GRANT_TYPES,
   MCPServerConfig,
   MCPToolEntry,
   A2AAgentConfig,
+  MCPGatewayConfig,
   ToolProtocol,
+  detectAwsServiceFromUrl,
+  extractAwsRegionFromUrl,
 } from '../models/admin-tool.model';
 
 @Component({
   selector: 'app-tool-form',
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [RouterLink, ReactiveFormsModule, NgIcon],
-  providers: [provideIcons({ heroArrowLeft, heroServer, heroUserGroup, heroLink, heroShieldCheck, heroPlus, heroTrash })],
+  providers: [provideIcons({ heroArrowLeft, heroServer, heroUserGroup, heroLink, heroShieldCheck, heroPlus, heroTrash, heroExclamationTriangle })],
   template: `
     <div class="min-h-dvh">
       <div class="mx-auto max-w-3xl px-4 py-8 sm:px-6 lg:px-8">
@@ -434,6 +442,298 @@ import {
               </section>
             }
 
+            <!-- MCP Gateway Target Configuration -->
+            @if (selectedProtocol() === 'mcp') {
+              <section class="space-y-4 border-t border-gray-200 pt-8 dark:border-gray-700">
+                <div class="flex items-center gap-2">
+                  <ng-icon name="heroServer" class="size-5 text-blue-600 dark:text-blue-400" aria-hidden="true" />
+                  <h2 class="text-base/7 font-semibold text-gray-900 dark:text-white">Gateway target configuration</h2>
+                </div>
+                <p class="text-sm/6 text-gray-600 dark:text-gray-400">
+                  Registers an externally deployed MCP server as a target on the centralized AgentCore Gateway.
+                  Saving creates the live Gateway target in AWS; if that fails the catalog entry is not saved.
+                </p>
+
+                <!-- Target name and endpoint -->
+                <div>
+                  <label for="gwTargetName" class="block text-sm/6 font-medium text-gray-700 dark:text-gray-300">
+                    Target name <span class="text-red-600">*</span>
+                  </label>
+                  <input
+                    id="gwTargetName"
+                    type="text"
+                    formControlName="gwTargetName"
+                    placeholder="weather-search"
+                    class="mt-1 block w-full rounded-2xl border border-gray-300 bg-white px-3 py-2 text-sm/6 text-gray-900 placeholder:text-gray-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-800 dark:text-white dark:placeholder:text-gray-500"
+                  />
+                  <p class="mt-1 text-xs/5 text-gray-500 dark:text-gray-400">
+                    Unique name for the target on the gateway.
+                  </p>
+                </div>
+
+                <div>
+                  <label for="gwEndpointUrl" class="block text-sm/6 font-medium text-gray-700 dark:text-gray-300">
+                    Endpoint URL <span class="text-red-600">*</span>
+                  </label>
+                  <input
+                    id="gwEndpointUrl"
+                    type="url"
+                    formControlName="gwEndpointUrl"
+                    placeholder="https://your-mcp-server.example.com/mcp"
+                    class="mt-1 block w-full rounded-2xl border border-gray-300 bg-white px-3 py-2 text-sm/6 text-gray-900 placeholder:text-gray-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-800 dark:text-white dark:placeholder:text-gray-500"
+                  />
+                  <p class="mt-1 text-xs/5 text-gray-500 dark:text-gray-400">
+                    The external MCP server endpoint the Gateway will call.
+                  </p>
+                </div>
+
+                <!-- Listing mode and credential type -->
+                <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                  <div>
+                    <label for="gwListingMode" class="block text-sm/6 font-medium text-gray-700 dark:text-gray-300">
+                      Listing mode
+                    </label>
+                    <select
+                      id="gwListingMode"
+                      formControlName="gwListingMode"
+                      [attr.disabled]="form.get('gwCredentialType')?.value === 'oauth' ? '' : null"
+                      class="mt-1 block w-full rounded-2xl border border-gray-300 bg-white px-3 py-2 text-sm/6 text-gray-900 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-60 dark:border-gray-600 dark:bg-gray-800 dark:text-white"
+                    >
+                      @for (mode of gatewayListingModes; track mode.value) {
+                        <option [value]="mode.value">{{ mode.label }}</option>
+                      }
+                    </select>
+                    <p class="mt-1 text-xs/5 text-gray-500 dark:text-gray-400">
+                      @if (form.get('gwCredentialType')?.value === 'oauth') {
+                        OAuth requires Default listing (Dynamic disables 3LO + semantic search).
+                      } @else {
+                        Dynamic resolves tools at call time but disables semantic search.
+                      }
+                    </p>
+                  </div>
+
+                  <div>
+                    <label for="gwCredentialType" class="block text-sm/6 font-medium text-gray-700 dark:text-gray-300">
+                      Outbound credential
+                    </label>
+                    <select
+                      id="gwCredentialType"
+                      formControlName="gwCredentialType"
+                      class="mt-1 block w-full rounded-2xl border border-gray-300 bg-white px-3 py-2 text-sm/6 text-gray-900 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-800 dark:text-white"
+                    >
+                      @for (cred of gatewayCredentialTypes; track cred.value) {
+                        <option [value]="cred.value">{{ cred.label }}</option>
+                      }
+                    </select>
+                    <p class="mt-1 text-xs/5 text-gray-500 dark:text-gray-400">
+                      How the Gateway authenticates to the target endpoint.
+                    </p>
+                    @if (showIamRecommendation()) {
+                      <p class="mt-1 flex items-start gap-1.5 text-xs/5 text-amber-700 dark:text-amber-400">
+                        <ng-icon name="heroExclamationTriangle" class="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+                        <span>This looks like an AWS-hosted endpoint (Lambda / API Gateway /
+                        AgentCore). It likely requires IAM — pick <strong>Gateway IAM Role
+                        (SigV4)</strong>, or the gateway will get a 403 when it lists the
+                        target's tools.</span>
+                      </p>
+                    }
+                  </div>
+                </div>
+
+                <!-- AWS service + region (for gateway IAM role) -->
+                @if (form.get('gwCredentialType')?.value === 'gateway_iam_role') {
+                  <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                    <div>
+                      <label for="gwAwsService" class="block text-sm/6 font-medium text-gray-700 dark:text-gray-300">
+                        AWS service <span class="text-red-600">*</span>
+                      </label>
+                      <input
+                        id="gwAwsService"
+                        type="text"
+                        formControlName="gwAwsService"
+                        placeholder="lambda, execute-api, bedrock-agentcore"
+                        class="mt-1 block w-full rounded-2xl border border-gray-300 bg-white px-3 py-2 text-sm/6 text-gray-900 placeholder:text-gray-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-800 dark:text-white dark:placeholder:text-gray-500"
+                      />
+                      <p class="mt-1 text-xs/5 text-gray-500 dark:text-gray-400">
+                        Auto-detected from the endpoint URL for Lambda / API Gateway /
+                        AgentCore hosts. Override only for a custom domain.
+                      </p>
+                    </div>
+                    <div>
+                      <label for="gwAwsRegion" class="block text-sm/6 font-medium text-gray-700 dark:text-gray-300">
+                        AWS region
+                      </label>
+                      <input
+                        id="gwAwsRegion"
+                        type="text"
+                        formControlName="gwAwsRegion"
+                        placeholder="defaults to the gateway's region"
+                        class="mt-1 block w-full rounded-2xl border border-gray-300 bg-white px-3 py-2 text-sm/6 text-gray-900 placeholder:text-gray-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-800 dark:text-white dark:placeholder:text-gray-500"
+                      />
+                      <p class="mt-1 text-xs/5 text-gray-500 dark:text-gray-400">
+                        Optional — auto-detected from the endpoint URL; AWS defaults it
+                        to the gateway's region.
+                      </p>
+                    </div>
+                  </div>
+
+                  @if (isLambdaUrlEndpoint()) {
+                    <div>
+                      <label for="gwLambdaFunctionName" class="block text-sm/6 font-medium text-gray-700 dark:text-gray-300">
+                        Lambda function name <span class="text-red-600">*</span>
+                      </label>
+                      <input
+                        id="gwLambdaFunctionName"
+                        type="text"
+                        formControlName="gwLambdaFunctionName"
+                        placeholder="mcp-class-search-dev"
+                        class="mt-1 block w-full rounded-2xl border border-gray-300 bg-white px-3 py-2 text-sm/6 text-gray-900 placeholder:text-gray-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-800 dark:text-white dark:placeholder:text-gray-500"
+                      />
+                      <p class="mt-1 text-xs/5 text-gray-500 dark:text-gray-400">
+                        The Lambda behind this Function URL. We grant the gateway
+                        permission to invoke it at save — no infra change needed.
+                        <strong>Same-account only</strong>; a cross-account function is
+                        rejected at save (make it public or use a credential provider).
+                      </p>
+                    </div>
+                  }
+                }
+
+                <!-- Credential provider ARN (for oauth / api_key) -->
+                @if (form.get('gwCredentialType')?.value === 'oauth' || form.get('gwCredentialType')?.value === 'api_key') {
+                  <div>
+                    <label for="gwCredentialProviderArn" class="block text-sm/6 font-medium text-gray-700 dark:text-gray-300">
+                      Credential provider ARN <span class="text-red-600">*</span>
+                    </label>
+                    <input
+                      id="gwCredentialProviderArn"
+                      type="text"
+                      formControlName="gwCredentialProviderArn"
+                      placeholder="arn:aws:bedrock-agentcore:...:token-vault/default/oauth2credentialprovider/..."
+                      class="mt-1 block w-full rounded-2xl border border-gray-300 bg-white px-3 py-2 font-mono text-sm/6 text-gray-900 placeholder:text-gray-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-800 dark:text-white dark:placeholder:text-gray-500"
+                    />
+                    <p class="mt-1 text-xs/5 text-gray-500 dark:text-gray-400">
+                      An existing AgentCore credential provider. Provisioning providers is out of scope here — manage them in
+                      <a routerLink="/admin/connectors" class="font-medium text-blue-600 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300">Connectors</a>.
+                    </p>
+                  </div>
+                }
+
+                <!-- OAuth scopes + grant type (for oauth) -->
+                @if (form.get('gwCredentialType')?.value === 'oauth') {
+                  <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                    <div>
+                      <label for="gwOauthScopes" class="block text-sm/6 font-medium text-gray-700 dark:text-gray-300">
+                        OAuth scopes
+                      </label>
+                      <input
+                        id="gwOauthScopes"
+                        type="text"
+                        formControlName="gwOauthScopes"
+                        placeholder="openid profile email"
+                        class="mt-1 block w-full rounded-2xl border border-gray-300 bg-white px-3 py-2 text-sm/6 text-gray-900 placeholder:text-gray-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-800 dark:text-white dark:placeholder:text-gray-500"
+                      />
+                      <p class="mt-1 text-xs/5 text-gray-500 dark:text-gray-400">
+                        Space- or comma-separated.
+                      </p>
+                    </div>
+                    <div>
+                      <label for="gwGrantType" class="block text-sm/6 font-medium text-gray-700 dark:text-gray-300">
+                        Grant type
+                      </label>
+                      <select
+                        id="gwGrantType"
+                        formControlName="gwGrantType"
+                        class="mt-1 block w-full rounded-2xl border border-gray-300 bg-white px-3 py-2 text-sm/6 text-gray-900 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-800 dark:text-white"
+                      >
+                        @for (grant of gatewayOauthGrantTypes; track grant.value) {
+                          <option [value]="grant.value">{{ grant.label }}</option>
+                        }
+                      </select>
+                      <p class="mt-1 text-xs/5 text-gray-500 dark:text-gray-400">
+                        Authorization Code (3LO) requires the user to connect the provider first.
+                      </p>
+                    </div>
+                  </div>
+                }
+
+                <!-- Gateway tools (per-tool approval flags) -->
+                <div formArrayName="gwTools">
+                  <div class="mb-2 flex items-center justify-between">
+                    <span class="block text-sm/6 font-medium text-gray-700 dark:text-gray-300">
+                      Tools
+                    </span>
+                    <div class="flex items-center gap-1">
+                      <button
+                        type="button"
+                        (click)="discoverGatewayTools()"
+                        [disabled]="discovering() || !form.get('gwEndpointUrl')?.value"
+                        class="inline-flex items-center gap-1 rounded-2xl px-2.5 py-1 text-sm/6 font-medium text-blue-600 hover:bg-blue-50 hover:text-blue-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500 disabled:cursor-not-allowed disabled:opacity-50 dark:text-blue-400 dark:hover:bg-blue-900/20"
+                      >
+                        {{ discovering() ? 'Discovering…' : 'Discover from server' }}
+                      </button>
+                      <button
+                        type="button"
+                        (click)="addGwTool()"
+                        class="inline-flex items-center gap-1 rounded-2xl px-2.5 py-1 text-sm/6 font-medium text-blue-600 hover:bg-blue-50 hover:text-blue-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500 dark:text-blue-400 dark:hover:bg-blue-900/20"
+                      >
+                        <ng-icon name="heroPlus" class="size-4" aria-hidden="true" />
+                        Add Tool
+                      </button>
+                    </div>
+                  </div>
+                  @if (discoverError()) {
+                    <p class="mb-2 text-sm/6 text-red-600 dark:text-red-400">
+                      {{ discoverError() }}
+                    </p>
+                  }
+
+                  @if (gwToolsArray.length === 0) {
+                    <p class="text-xs/5 italic text-gray-500 dark:text-gray-400">
+                      Optional. Discover from the server or add tool names manually to attach per-tool approval flags.
+                    </p>
+                  } @else {
+                    <div class="space-y-2">
+                      @for (row of gwToolsArray.controls; track $index) {
+                        <div [formGroupName]="$index" class="flex items-start gap-2 rounded-2xl border border-gray-200 bg-white p-2 dark:border-gray-700 dark:bg-gray-800">
+                          <div class="flex-1">
+                            <input
+                              type="text"
+                              formControlName="name"
+                              placeholder="tool_name"
+                              [attr.aria-label]="'Gateway tool name ' + ($index + 1)"
+                              class="block w-full rounded-2xl border border-gray-300 bg-white px-3 py-1.5 font-mono text-sm/6 text-gray-900 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-900 dark:text-white"
+                            />
+                          </div>
+                          <label class="flex items-center gap-1.5 whitespace-nowrap pt-1.5 text-xs/5 text-gray-700 dark:text-gray-300">
+                            <input
+                              type="checkbox"
+                              formControlName="needsApproval"
+                              class="size-4 rounded border-gray-300 text-amber-600 focus:ring-2 focus:ring-amber-500 dark:border-gray-600 dark:bg-gray-800"
+                            />
+                            <span>Needs approval</span>
+                          </label>
+                          <button
+                            type="button"
+                            (click)="removeGwTool($index)"
+                            [attr.aria-label]="'Remove gateway tool ' + ($index + 1)"
+                            class="flex size-8 shrink-0 items-center justify-center rounded-2xl text-gray-400 hover:bg-red-50 hover:text-red-600 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-red-500 dark:text-gray-500 dark:hover:bg-red-900/20 dark:hover:text-red-400"
+                          >
+                            <ng-icon name="heroTrash" class="size-4" aria-hidden="true" />
+                          </button>
+                        </div>
+                      }
+                    </div>
+                  }
+                  <p class="mt-2 text-xs/5 text-gray-500 dark:text-gray-400">
+                    Note: per-tool approval flags are stored but not yet enforced for Gateway tools (tracked separately).
+                    For OAuth targets, users connect the provider via
+                    <a routerLink="/admin/connectors" class="font-medium text-blue-600 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300">Connectors</a>.
+                  </p>
+                </div>
+              </section>
+            }
+
             <!-- A2A Agent Configuration -->
             @if (selectedProtocol() === 'a2a') {
               <section class="space-y-4 border-t border-gray-200 pt-8 dark:border-gray-700">
@@ -666,6 +966,9 @@ export class ToolFormPage implements OnInit {
   readonly mcpTransports = MCP_TRANSPORTS;
   readonly mcpAuthTypes = MCP_AUTH_TYPES;
   readonly a2aAuthTypes = A2A_AUTH_TYPES;
+  readonly gatewayListingModes = GATEWAY_LISTING_MODES;
+  readonly gatewayCredentialTypes = GATEWAY_CREDENTIAL_TYPES;
+  readonly gatewayOauthGrantTypes = GATEWAY_OAUTH_GRANT_TYPES;
 
   loading = signal(false);
   saving = signal(false);
@@ -673,6 +976,13 @@ export class ToolFormPage implements OnInit {
   toolId = signal<string | null>(null);
   discovering = signal(false);
   discoverError = signal<string | null>(null);
+
+  // Last values auto-derived from the Gateway endpoint URL. We only overwrite
+  // the AWS service/region controls while they still hold what we derived (i.e.
+  // the admin hasn't hand-edited or a load hasn't supplied a value), so manual
+  // overrides and loaded config are never clobbered. See syncDerivedAwsFields.
+  private lastDerivedAwsService = '';
+  private lastDerivedAwsRegion = '';
 
   readonly isEditMode = computed(() => !!this.toolId());
   readonly selectedProtocol = signal<ToolProtocol>('local');
@@ -709,6 +1019,18 @@ export class ToolFormPage implements OnInit {
     a2aCapabilities: [''],
     a2aTimeoutSeconds: [120],
     a2aMaxRetries: [3],
+    // MCP Gateway target configuration (protocol 'mcp')
+    gwTargetName: [''],
+    gwEndpointUrl: [''],
+    gwListingMode: ['default'],
+    gwCredentialType: ['none'],
+    gwCredentialProviderArn: [''],
+    gwAwsService: [''],
+    gwAwsRegion: [''],
+    gwLambdaFunctionName: [''],
+    gwOauthScopes: [''],
+    gwGrantType: ['authorization_code'],
+    gwTools: this.fb.array([] as FormGroup[]),
   });
 
   constructor() {
@@ -747,6 +1069,18 @@ export class ToolFormPage implements OnInit {
     this.mcpToolsArray.removeAt(index);
   }
 
+  get gwToolsArray(): FormArray<FormGroup> {
+    return this.form.get('gwTools') as FormArray<FormGroup>;
+  }
+
+  addGwTool(): void {
+    this.gwToolsArray.push(this.buildMcpToolRow());
+  }
+
+  removeGwTool(index: number): void {
+    this.gwToolsArray.removeAt(index);
+  }
+
   async discoverMcpTools(): Promise<void> {
     const formValue = this.form.getRawValue();
     if (!formValue.mcpServerUrl) {
@@ -763,6 +1097,7 @@ export class ToolFormPage implements OnInit {
         awsRegion: formValue.mcpAwsRegion || null,
         apiKeyHeader: formValue.mcpApiKeyHeader || null,
         secretArn: formValue.mcpSecretArn || null,
+        forwardAuthToken: formValue.forwardAuthToken || false,
       });
 
       // Merge: keep existing rows (and their needsApproval flag), append any
@@ -798,6 +1133,122 @@ export class ToolFormPage implements OnInit {
     }
   }
 
+  /**
+   * Discover the tools exposed by a Gateway target's MCP endpoint, by
+   * connecting to it directly (admin-side) via the same /discover endpoint
+   * used for mcp_external. The Gateway's outbound credential type maps to the
+   * direct-connection auth: a gateway-IAM-role target is SigV4-protected, so
+   * we sign with aws-iam; otherwise we attempt an unauthenticated list (OAuth /
+   * API-key endpoints can't be discovered admin-side — the server's error is
+   * surfaced, and the admin can add tool names by hand).
+   */
+  /**
+   * Auto-populate the AWS service + region for a Gateway IAM-role target from
+   * the endpoint URL. Both are mechanically derivable from a Lambda Function
+   * URL / API Gateway / AgentCore Gateway host, so the admin shouldn't have to
+   * type them — the fields stay editable as overrides. We only overwrite a
+   * field while it still equals the value we last derived, so a hand-edited
+   * override (or a value loaded in edit mode) is preserved.
+   */
+  /**
+   * Recommend the IAM outbound credential when the endpoint is an AWS-hosted
+   * host (Lambda URL / API Gateway / AgentCore) but the admin left the credential
+   * as "None". Such endpoints almost always require SigV4, so "None" would make
+   * the gateway 403 when it lists the target's tools. URL-pattern heuristic only
+   * — a definitive AuthType check would need a backend probe (a later preflight).
+   */
+  showIamRecommendation(): boolean {
+    const cred = this.form.get('gwCredentialType')?.value;
+    const url = this.form.get('gwEndpointUrl')?.value ?? '';
+    return cred === 'none' && detectAwsServiceFromUrl(url) !== '';
+  }
+
+  /**
+   * True when the endpoint is a Lambda Function URL — the only case that needs
+   * the function name, so the platform can grant the gateway role invoke on it
+   * at registration.
+   */
+  isLambdaUrlEndpoint(): boolean {
+    return detectAwsServiceFromUrl(this.form.get('gwEndpointUrl')?.value ?? '') === 'lambda';
+  }
+
+  private syncDerivedAwsFields(): void {
+    if (this.form.get('gwCredentialType')?.value !== 'gateway_iam_role') {
+      return;
+    }
+    const url = this.form.get('gwEndpointUrl')?.value ?? '';
+
+    const service = detectAwsServiceFromUrl(url);
+    const serviceCtrl = this.form.get('gwAwsService');
+    if (service && (serviceCtrl?.value ?? '') === this.lastDerivedAwsService) {
+      serviceCtrl?.setValue(service);
+      this.lastDerivedAwsService = service;
+    }
+
+    const region = extractAwsRegionFromUrl(url);
+    const regionCtrl = this.form.get('gwAwsRegion');
+    if (region && (regionCtrl?.value ?? '') === this.lastDerivedAwsRegion) {
+      regionCtrl?.setValue(region);
+      this.lastDerivedAwsRegion = region;
+    }
+  }
+
+  async discoverGatewayTools(): Promise<void> {
+    const formValue = this.form.getRawValue();
+    if (!formValue.gwEndpointUrl) {
+      return;
+    }
+
+    this.discovering.set(true);
+    this.discoverError.set(null);
+    try {
+      const authType = formValue.gwCredentialType === 'gateway_iam_role' ? 'aws-iam' : 'none';
+      const response = await this.adminToolService.discoverMCPTools({
+        serverUrl: formValue.gwEndpointUrl,
+        transport: 'streamable-http',
+        authType,
+        awsRegion: null,
+        apiKeyHeader: null,
+        secretArn: null,
+      });
+
+      // Merge: keep existing rows (and their needsApproval flag), append any
+      // newly-discovered names. Mirrors discoverMcpTools.
+      const existingByName = new Map<string, FormGroup>();
+      for (const ctrl of this.gwToolsArray.controls) {
+        const name = (ctrl.get('name')?.value ?? '').trim();
+        if (name) {
+          existingByName.set(name, ctrl);
+        }
+      }
+
+      for (const tool of response.tools) {
+        const existing = existingByName.get(tool.name);
+        if (existing) {
+          if (tool.description && !existing.get('description')?.value) {
+            existing.get('description')?.setValue(tool.description);
+          }
+        } else {
+          this.gwToolsArray.push(this.buildMcpToolRow({
+            name: tool.name,
+            needsApproval: false,
+            description: tool.description ?? null,
+          }));
+        }
+      }
+    } catch (err: unknown) {
+      const detail =
+        err instanceof HttpErrorResponse && err.error && typeof err.error === 'object' && 'detail' in err.error
+          ? String((err.error as { detail: unknown }).detail)
+          : err instanceof Error
+            ? err.message
+            : 'Discovery failed.';
+      this.discoverError.set(detail);
+    } finally {
+      this.discovering.set(false);
+    }
+  }
+
   async ngOnInit(): Promise<void> {
     // Listen for protocol changes to update the signal
     this.form.get('protocol')?.valueChanges.subscribe(value => {
@@ -814,6 +1265,22 @@ export class ToolFormPage implements OnInit {
       if (value && this.form.get('forwardAuthToken')?.value) {
         this.form.get('forwardAuthToken')?.setValue(false);
       }
+    });
+
+    // Co-gating: OAuth (3LO) targets require DEFAULT listing — DYNAMIC disables
+    // 3LO and semantic search. Force it so the backend doesn't 400.
+    this.form.get('gwCredentialType')?.valueChanges.subscribe(value => {
+      if (value === 'oauth' && this.form.get('gwListingMode')?.value !== 'default') {
+        this.form.get('gwListingMode')?.setValue('default');
+      }
+      // Populate AWS service/region as soon as the admin picks IAM role, so the
+      // fields aren't blank when their panel first appears.
+      this.syncDerivedAwsFields();
+    });
+
+    // Auto-derive the IAM service/region from the endpoint host as it's typed.
+    this.form.get('gwEndpointUrl')?.valueChanges.subscribe(() => {
+      this.syncDerivedAwsFields();
     });
 
     const id = this.route.snapshot.paramMap.get('toolId');
@@ -876,6 +1343,26 @@ export class ToolFormPage implements OnInit {
         });
       }
 
+      // MCP Gateway target configuration
+      if (tool.mcpGatewayConfig) {
+        this.form.patchValue({
+          gwTargetName: tool.mcpGatewayConfig.targetName,
+          gwEndpointUrl: tool.mcpGatewayConfig.endpointUrl,
+          gwListingMode: tool.mcpGatewayConfig.listingMode,
+          gwCredentialType: tool.mcpGatewayConfig.credentialType,
+          gwCredentialProviderArn: tool.mcpGatewayConfig.credentialProviderArn || '',
+          gwAwsService: tool.mcpGatewayConfig.awsService || '',
+          gwAwsRegion: tool.mcpGatewayConfig.awsRegion || '',
+          gwLambdaFunctionName: tool.mcpGatewayConfig.lambdaFunctionName || '',
+          gwOauthScopes: (tool.mcpGatewayConfig.oauthScopes || []).join(' '),
+          gwGrantType: tool.mcpGatewayConfig.grantType,
+        });
+        this.gwToolsArray.clear();
+        for (const entry of tool.mcpGatewayConfig.tools) {
+          this.gwToolsArray.push(this.buildMcpToolRow(entry));
+        }
+      }
+
       // Disable toolId in edit mode
       this.form.get('toolId')?.disable();
     } catch (err: unknown) {
@@ -934,6 +1421,53 @@ export class ToolFormPage implements OnInit {
         };
       }
 
+      // Build Gateway target config if protocol is mcp
+      let mcpGatewayConfig: MCPGatewayConfig | undefined;
+      if (formValue.protocol === 'mcp' && formValue.gwTargetName && formValue.gwEndpointUrl) {
+        const gwTools: MCPToolEntry[] = (formValue.gwTools ?? [])
+          .map((row: { name?: string; needsApproval?: boolean; description?: string | null }) => ({
+            name: (row.name ?? '').trim(),
+            needsApproval: !!row.needsApproval,
+            description: row.description?.trim() || null,
+          }))
+          .filter((row: MCPToolEntry) => row.name.length > 0);
+
+        const credentialType = formValue.gwCredentialType;
+        const isOauth = credentialType === 'oauth';
+        const isIam = credentialType === 'gateway_iam_role';
+        mcpGatewayConfig = {
+          targetName: formValue.gwTargetName,
+          endpointUrl: formValue.gwEndpointUrl,
+          listingMode: formValue.gwListingMode,
+          credentialType,
+          // ARN only applies to oauth / api_key.
+          credentialProviderArn:
+            isOauth || credentialType === 'api_key' ? (formValue.gwCredentialProviderArn || null) : null,
+          // IAM role signs SigV4 against an AWS service. Both are normally
+          // auto-derived from the endpoint host into the form; fall back to
+          // deriving here so a blank field still saves a valid config.
+          awsService: isIam
+            ? (formValue.gwAwsService || detectAwsServiceFromUrl(formValue.gwEndpointUrl) || null)
+            : null,
+          awsRegion: isIam
+            ? (formValue.gwAwsRegion || extractAwsRegionFromUrl(formValue.gwEndpointUrl) || null)
+            : null,
+          // Only meaningful for an IAM target on a Lambda Function URL — lets the
+          // backend grant the gateway role invoke on exactly this function.
+          lambdaFunctionName:
+            isIam && detectAwsServiceFromUrl(formValue.gwEndpointUrl) === 'lambda'
+              ? (formValue.gwLambdaFunctionName?.trim() || null)
+              : null,
+          oauthScopes:
+            isOauth && formValue.gwOauthScopes
+              ? formValue.gwOauthScopes.split(/[\s,]+/).map((s: string) => s.trim()).filter((s: string) => s)
+              : [],
+          grantType: formValue.gwGrantType,
+          customParameters: null,
+          tools: gwTools,
+        };
+      }
+
       // Get OAuth provider value (empty string becomes null)
       const requiresOauthProvider = formValue.requiresOauthProvider || null;
 
@@ -951,6 +1485,7 @@ export class ToolFormPage implements OnInit {
           forwardAuthToken: formValue.forwardAuthToken || false,
           mcpConfig: mcpConfig,
           a2aConfig: a2aConfig,
+          mcpGatewayConfig: mcpGatewayConfig,
         });
       } else {
         // Create new tool
@@ -967,16 +1502,43 @@ export class ToolFormPage implements OnInit {
           forwardAuthToken: formValue.forwardAuthToken || false,
           mcpConfig: mcpConfig,
           a2aConfig: a2aConfig,
+          mcpGatewayConfig: mcpGatewayConfig,
         });
       }
 
       await this.router.navigate(['/admin/tools']);
     } catch (err: unknown) {
       console.error('Error saving tool:', err);
-      const message = err instanceof Error ? err.message : 'Failed to save tool.';
-      this.error.set(message);
+      this.error.set(this.describeSaveError(err));
     } finally {
       this.saving.set(false);
     }
+  }
+
+  /**
+   * Build a friendly error message, distinguishing a Gateway target failure
+   * (502, the live AWS target couldn't be created/updated/deleted) from a
+   * validation error (400) and a conflict / state divergence (409). The
+   * service re-throws the HttpErrorResponse, whose `error.detail` carries the
+   * backend message.
+   */
+  private describeSaveError(err: unknown): string {
+    if (err instanceof HttpErrorResponse) {
+      const detail =
+        (err.error && typeof err.error === 'object' && 'detail' in err.error
+          ? String((err.error as { detail: unknown }).detail)
+          : '') || err.message;
+      switch (err.status) {
+        case 400:
+          return `Validation error: ${detail}`;
+        case 409:
+          return `Conflict: ${detail}`;
+        case 502:
+          return `Gateway target operation failed (the catalog entry was not saved): ${detail}`;
+        default:
+          return detail || 'Failed to save tool.';
+      }
+    }
+    return err instanceof Error ? err.message : 'Failed to save tool.';
   }
 }

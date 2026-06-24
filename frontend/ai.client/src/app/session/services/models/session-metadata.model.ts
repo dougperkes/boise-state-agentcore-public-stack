@@ -17,6 +17,8 @@ export interface SessionPreferences {
   selectedPromptId?: string;
   customPromptText?: string;
   assistantId?: string;
+  /** Agent mode this conversation runs in ('skill' or 'chat'). */
+  agentType?: 'skill' | 'chat';
   /** Display state for promoted visuals, keyed by tool_use_id */
   visualState?: Record<string, VisualDisplayState>;
 }
@@ -58,7 +60,10 @@ export interface UpdateSessionMetadataRequest {
   tags?: string[];
   lastModel?: string;
   enabledTools?: string[];
-  selectedPromptId?: string;
+  /** Send `null` to explicitly clear the selection. Omit the field to leave
+   *  the persisted value unchanged. */
+  selectedPromptId?: string | null;
   customPromptText?: string;
   assistantId?: string;
+  agentType?: 'skill' | 'chat';
 }

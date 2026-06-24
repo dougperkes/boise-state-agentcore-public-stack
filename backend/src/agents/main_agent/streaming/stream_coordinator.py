@@ -11,7 +11,12 @@ from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
 from agents.main_agent.config.constants import EnvVars
-from apis.shared.errors import ErrorCode, StreamErrorEvent, build_conversational_error_event
+from apis.shared.errors import (
+    ConversationalErrorEvent,
+    ErrorCode,
+    StreamErrorEvent,
+    build_conversational_error_event,
+)
 
 from .stream_processor import process_agent_stream
 
@@ -85,6 +90,20 @@ class StreamCoordinator:
         # empty and unused unless AGENTCORE_MCP_APPS_HOST_ENABLED=true.
         ui_tool_use_names: Dict[str, str] = {}
         ui_resource_emitted: set[str] = set()
+        # Dedupes the instant header-only `ui_resource` shell (empty html, no
+        # `resources/read`) emitted at `content_block_start` so the App frame's
+        # header replaces the tool rail immediately — separate from
+        # `ui_resource_emitted` so it never blocks the full html-bearing emit.
+        ui_header_emitted: set[str] = set()
+        # MCP Apps (streaming tool input, SEP-1865): a UI tool's frame is
+        # mounted early at its `content_block_start` so the App's bridge is
+        # live *while* the model streams the tool's arguments. We map a
+        # tool-use block's index -> toolUseId (deltas carry only the index)
+        # and accumulate the raw `toolUse.input` fragments per toolUseId, then
+        # emit healed `ui_tool_input_partial` SSEs so a progressively-rendering
+        # App (e.g. Excalidraw's guided camera tour) animates as args arrive.
+        ui_block_index_to_tool_use_id: Dict[int, str] = {}
+        ui_partial_input_acc: Dict[str, str] = {}
 
         # Accumulate metadata from stream
         accumulated_metadata: Dict[str, Any] = {"usage": {}, "metrics": {}}
@@ -198,6 +217,12 @@ class StreamCoordinator:
                         tuid = tu.get("toolUseId") or tu.get("tool_use_id")
                         if tn and tuid:
                             ui_tool_use_names[tuid] = tn
+                        # Map block index -> toolUseId so streaming
+                        # `content_block_delta`s (which carry only the index)
+                        # can be attributed to a toolUseId for partial input.
+                        bidx = bd.get("contentBlockIndex")
+                        if tuid and bidx is not None:
+                            ui_block_index_to_tool_use_id[bidx] = tuid
 
                 # Track when assistant messages end
                 if event.get("type") == "message_stop":
@@ -401,6 +426,21 @@ class StreamCoordinator:
                             except Exception as ctx_err:
                                 logger.debug(f"Skipping contextWindow lookup: {ctx_err}")
 
+                            # Per-turn context attribution (system / tools /
+                            # messages), computed by ContextAttributionHook at
+                            # BeforeModelCallEvent and stashed on the agent.
+                            # Partitions sum to `total`; the frontend pairs it
+                            # with `contextWindow` above for free-space.
+                            try:
+                                from agents.main_agent.session.hooks.context_attribution import (
+                                    get_context_breakdown,
+                                )
+                                breakdown = get_context_breakdown(agent)
+                                if breakdown is not None:
+                                    final_metadata["contextBreakdown"] = breakdown
+                            except Exception as br_err:
+                                logger.debug(f"Skipping contextBreakdown: {br_err}")
+
                         # Log cache metrics for performance monitoring
                         self._log_cache_metrics(usage=final_metadata.get("usage", {}), session_id=session_id)
 
@@ -492,13 +532,45 @@ class StreamCoordinator:
                     except ValueError:
                         error_code = ErrorCode.STREAM_ERROR
 
-                    # Create a synthetic exception for build_conversational_error_event
-                    synthetic_error = Exception(f"{error_message}: {error_detail}" if error_detail else error_message)
+                    # When stream_processor's force_stop classifier (in
+                    # _format_force_stop_message) already produced friendly
+                    # user-facing markdown — recognizable by the leading "⚠️"
+                    # — pass it through unwrapped. The generic
+                    # build_conversational_error_event template would
+                    # otherwise wrap it in a second "⚠️ Something went
+                    # wrong" + blockquote, double-marking the message and
+                    # appending a ceremonial "Please try again." The
+                    # unclassified "Agent force-stopped: {raw}" fallthrough
+                    # has no warning prefix and still goes through the
+                    # generic wrapper below.
+                    recoverable = error_data.get("recoverable", False)
+                    if (
+                        error_code == ErrorCode.AGENT_ERROR
+                        and error_message
+                        and error_message.lstrip().startswith("⚠️")
+                    ):
+                        metadata: Optional[Dict[str, Any]] = (
+                            {"session_id": session_id} if session_id else None
+                        )
+                        conv_error_event = ConversationalErrorEvent(
+                            code=error_code,
+                            message=error_message,
+                            recoverable=recoverable,
+                            metadata=metadata,
+                        )
+                    else:
+                        # Create a synthetic exception for build_conversational_error_event
+                        synthetic_error = Exception(
+                            f"{error_message}: {error_detail}" if error_detail else error_message
+                        )
 
-                    # Build conversational error event
-                    conv_error_event = build_conversational_error_event(
-                        code=error_code, error=synthetic_error, session_id=session_id, recoverable=error_data.get("recoverable", False)
-                    )
+                        # Build conversational error event
+                        conv_error_event = build_conversational_error_event(
+                            code=error_code,
+                            error=synthetic_error,
+                            session_id=session_id,
+                            recoverable=recoverable,
+                        )
 
                     if error_code == ErrorCode.MAX_TOKENS:
                         # No verbose assistant bubble for truncation. The model
@@ -554,32 +626,36 @@ class StreamCoordinator:
                             f"(Strands already committed the recovered partial turn)"
                         )
                     else:
+                        # Persist ONLY the assistant turn. The user turn was
+                        # already persisted at turn start by Strands'
+                        # MessageAddedEvent hook (any error event reaching
+                        # this in-loop handler was emitted from inside
+                        # ``process_agent_stream``, after the agent stream
+                        # began iterating). Re-persisting the user turn
+                        # would either duplicate it or cause AgentCore
+                        # Memory to reject the conflicting write and drop
+                        # the assistant message along with it.
+                        #
+                        # Persist what the user saw live: PR #388's
+                        # double-wrap fix above means ``conv_error_event.message``
+                        # is the un-wrapped friendly text for classified
+                        # AGENT_ERROR cases (leading "⚠️") and the wrapped
+                        # template for everything else — same string the
+                        # content_block_delta below yields to the SSE
+                        # stream. Persisting it keeps live and
+                        # refresh-hydrated views in sync.
                         try:
-                            from strands.types.content import Message
-                            from strands.types.session import SessionMessage
-
+                            from agents.main_agent.session.persistence import persist_synthetic_messages
                             from agents.main_agent.session.session_factory import SessionFactory
 
                             persist_session_manager = SessionFactory.create_session_manager(session_id=session_id, user_id=user_id, caching_enabled=False)
-
-                            # Extract user text from prompt (can be string or ContentBlock list)
-                            if isinstance(prompt, str):
-                                user_text = prompt
-                            else:
-                                # Extract text from ContentBlock list
-                                user_text = " ".join(block.get("text", "") for block in prompt if isinstance(block, dict) and "text" in block)
-
-                            user_msg: Message = {"role": "user", "content": [{"text": user_text}]}
-                            assistant_msg: Message = {"role": "assistant", "content": [{"text": conv_error_event.message}]}
-
-                            if hasattr(persist_session_manager, "base_manager") and hasattr(persist_session_manager.base_manager, "create_message"):
-                                user_session_msg = SessionMessage.from_message(user_msg, 0)
-                                assistant_session_msg = SessionMessage.from_message(assistant_msg, 1)
-                                persist_session_manager.base_manager.create_message(session_id, "default", user_session_msg)
-                                persist_session_manager.base_manager.create_message(session_id, "default", assistant_session_msg)
-                                logger.info(f"💾 Saved intercepted error messages to session {session_id}")
+                            persist_synthetic_messages(
+                                persist_session_manager,
+                                session_id,
+                                [("assistant", conv_error_event.message)],
+                            )
                         except Exception as persist_error:
-                            logger.error(f"Failed to persist intercepted error to session: {persist_error}")
+                            logger.error(f"Failed to persist intercepted error to session: {persist_error}", exc_info=True)
 
                     # Skip the original error event and exit the loop - we've handled the error
                     return
@@ -613,8 +689,57 @@ class StreamCoordinator:
                         event,
                         ui_tool_use_names,
                         ui_resource_emitted,
+                        session_id=session_id,
+                        user_id=user_id,
                     ):
                         yield sse
+
+                # MCP Apps (streaming tool input): mount a UI tool's frame at
+                # its `content_block_start` — BEFORE the model streams the
+                # tool's arguments — so the App's bridge is live for the
+                # progressive `ui_tool_input_partial` stream below. Deduped vs
+                # the `tool_result` path above by `ui_resource_emitted`.
+                elif event.get("type") == "content_block_start":
+                    bd = event.get("data", {})
+                    if bd.get("type") == "tool_use":
+                        tu = bd.get("toolUse", {})
+                        tuid = tu.get("toolUseId") or tu.get("tool_use_id")
+                        tname = ui_tool_use_names.get(tuid) if tuid else None
+                        # Header-only shell FIRST (instant, no resources/read)
+                        # so the App frame's header + shimmer replace the tool
+                        # rail with no flash; the full html-bearing resource
+                        # follows below and mounts the iframe.
+                        for sse in self._emit_ui_app_header_for_tool(
+                            tname, tuid, ui_header_emitted
+                        ):
+                            yield sse
+                        for sse in await self._emit_ui_resource_for_tool(
+                            tname,
+                            tuid,
+                            ui_resource_emitted,
+                            session_id=session_id,
+                            user_id=user_id,
+                        ):
+                            yield sse
+
+                # Accumulate streamed `toolUse.input` fragments and emit a
+                # healed `ui_tool_input_partial` per delta — only for tools
+                # whose frame we actually mounted (a cheap dict-miss otherwise).
+                elif event.get("type") == "content_block_delta":
+                    bd = event.get("data", {})
+                    frag = bd.get("input")
+                    if bd.get("type") == "tool_use" and isinstance(frag, str):
+                        tuid = ui_block_index_to_tool_use_id.get(
+                            bd.get("contentBlockIndex")
+                        )
+                        if tuid and tuid in ui_resource_emitted:
+                            ui_partial_input_acc[tuid] = (
+                                ui_partial_input_acc.get(tuid, "") + frag
+                            )
+                            for sse in self._emit_tool_input_partial(
+                                tuid, ui_partial_input_acc[tuid]
+                            ):
+                                yield sse
 
             # Calculate end-to-end latency (fallback if done event wasn't received)
             stream_end_time = time.time()
@@ -779,7 +904,16 @@ class StreamCoordinator:
             # Emergency flush: save buffered messages before losing them
             self._emergency_flush(session_manager)
 
-            # Stream error as conversational assistant message for better UX
+            # This handler catches exceptions from stream_coordinator's own
+            # loop body (e.g. interrupt extraction, artifact lookup,
+            # metadata calculation). Exceptions from inside the agent
+            # stream are caught one level down by process_agent_stream's
+            # own `except Exception` and yielded as STREAM_ERROR events
+            # — the in-loop branch above handles those. See
+            # test_force_stop_persistence.py:217-235 for the trace path.
+            # Coordinator-internal failures don't carry Bedrock-y patterns
+            # the force_stop classifier could match, so use the generic
+            # STREAM_ERROR template directly.
             error_event = build_conversational_error_event(code=ErrorCode.STREAM_ERROR, error=e, session_id=session_id, recoverable=True)
 
             # Emit message events so error appears in chat
@@ -791,31 +925,19 @@ class StreamCoordinator:
             yield error_event.to_sse_format()
             yield "event: done\ndata: {}\n\n"
 
-            # Persist error messages to session
+            # Persist ONLY the assistant turn. Same reasoning as the
+            # AGENT_ERROR path above — the user turn was already persisted
+            # at turn start by Strands' MessageAddedEvent hook.
             try:
-                from strands.types.content import Message
-                from strands.types.session import SessionMessage
-
+                from agents.main_agent.session.persistence import persist_synthetic_messages
                 from agents.main_agent.session.session_factory import SessionFactory
 
                 persist_session_manager = SessionFactory.create_session_manager(session_id=session_id, user_id=user_id, caching_enabled=False)
-
-                # Extract user text from prompt (can be string or ContentBlock list)
-                if isinstance(prompt, str):
-                    user_text = prompt
-                else:
-                    # Extract text from ContentBlock list
-                    user_text = " ".join(block.get("text", "") for block in prompt if isinstance(block, dict) and "text" in block)
-
-                user_msg: Message = {"role": "user", "content": [{"text": user_text}]}
-                assistant_msg: Message = {"role": "assistant", "content": [{"text": error_event.message}]}
-
-                if hasattr(persist_session_manager, "base_manager") and hasattr(persist_session_manager.base_manager, "create_message"):
-                    user_session_msg = SessionMessage.from_message(user_msg, 0)
-                    assistant_session_msg = SessionMessage.from_message(assistant_msg, 1)
-                    persist_session_manager.base_manager.create_message(session_id, "default", user_session_msg)
-                    persist_session_manager.base_manager.create_message(session_id, "default", assistant_session_msg)
-                    logger.info(f"💾 Saved stream error messages to session {session_id}")
+                persist_synthetic_messages(
+                    persist_session_manager,
+                    session_id,
+                    [("assistant", error_event.message)],
+                )
             except Exception as persist_error:
                 logger.error(f"Failed to persist stream error to session: {persist_error}")
         finally:
@@ -888,7 +1010,9 @@ class StreamCoordinator:
                 caching_enabled=snapshot_source.get("caching_enabled"),
                 max_tokens=inference_params.get("max_tokens"),
                 agent_type=snapshot_source.get("agent_type"),
+                enabled_skills=snapshot_source.get("enabled_skills"),
                 inference_params=dict(inference_params) if inference_params else None,
+                mantle_endpoint_path=snapshot_source.get("mantle_endpoint_path"),
                 captured_at=now.isoformat(),
                 expires_at=(now + timedelta(hours=1)).isoformat(),
             )
@@ -1138,30 +1262,75 @@ class StreamCoordinator:
             )
         return events
 
-    async def _extract_ui_resource_events(
+    def _emit_ui_app_header_for_tool(
         self,
-        event: Dict[str, Any],
-        tool_use_names: Dict[str, str],
+        tool_name: Optional[str],
+        tool_use_id: Optional[str],
         emitted: set,
     ) -> List[str]:
-        """Yield a `ui_resource` SSE for a tool_result that ships an MCP App.
+        """Emit a UI tool's instant header-only `ui_resource` shell (empty html).
+
+        Runs at `content_block_start`, BEFORE the (potentially slow)
+        `resources/read` in `_emit_ui_resource_for_tool`, so the App frame's
+        header (icon + server + tool + shimmer) replaces the plain tool rail
+        with no flash. Synchronous + cheap: it reads only the in-process
+        catalog + captured `serverInfo` (no network). Deduped per toolUseId via
+        its own `emitted` set so it never blocks the full html-bearing emit.
+        Best-effort: any failure logs and returns [].
+        """
+        from agents.main_agent.integrations.mcp_apps import (
+            build_ui_app_header,
+            is_mcp_apps_host_enabled,
+        )
+
+        if not is_mcp_apps_host_enabled():
+            return []
+        if not tool_use_id or not tool_name or tool_use_id in emitted:
+            return []
+        try:
+            payload = build_ui_app_header(tool_name, tool_use_id)
+            if payload is None:
+                return []
+            emitted.add(tool_use_id)
+            return [f"event: ui_resource\ndata: {json.dumps(payload)}\n\n"]
+        except Exception as e:  # noqa: BLE001 - best-effort side channel
+            logger.warning("Failed to emit ui_resource header: %s", e)
+            return []
+
+    async def _emit_ui_resource_for_tool(
+        self,
+        tool_name: Optional[str],
+        tool_use_id: Optional[str],
+        emitted: set,
+        session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> List[str]:
+        """Fetch, emit, and persist a tool's MCP App `ui_resource` (deduped).
 
         PR #3 of the MCP Apps host-renderer initiative
-        (`docs/kaizen/scoping/mcp-apps-host-renderer.md`). When the host flag
-        is on and this tool_result's tool declared a `ui://` resource in its
-        `tools/list` `_meta.ui` (recorded in the catalog by PR #2), fetch that
-        resource via the spec-mandated `resources/read` against the same MCP
-        client that surfaced the tool, and emit a single
+        (`docs/kaizen/scoping/mcp-apps-host-renderer.md`), generalised so the
+        frame can mount EARLY. When the host flag is on and the tool declared
+        a `ui://` resource in its `tools/list` `_meta.ui` (recorded in the
+        catalog by PR #2), fetch that resource via the spec-mandated
+        `resources/read` against the same MCP client that surfaced the tool,
+        and emit a single
 
             `{type, toolUseId, resourceUri, html, mimeType, csp, permissions}`
 
-        event with the HTML inlined (so the frontend needs no MCP client).
-        The blocking `resources/read` runs in a worker thread so the live
-        stream is not stalled.
+        event with the HTML inlined (so the frontend needs no MCP client). The
+        blocking `resources/read` runs in a worker thread so the live stream
+        is not stalled.
+
+        Two call sites share this via the `emitted` dedupe set: the early
+        mount at a UI tool's `content_block_start` (so the App's bridge is
+        live *before* arguments stream — the window the `ui_tool_input_partial`
+        stream needs) and the legacy post-`tool_result` fallback (covers a
+        tool whose name wasn't captured at block start). The resource shell is
+        static per `resourceUri` — independent of the tool's args/result — so
+        fetching it at block start yields the same payload as at result time.
 
         Inert and zero-cost when `AGENTCORE_MCP_APPS_HOST_ENABLED` is false.
-        Best-effort: deduped per toolUseId, and any failure logs and returns
-        [] — it never breaks the stream.
+        Best-effort: any failure logs and returns [] — never breaks the stream.
         """
         from agents.main_agent.integrations.mcp_apps import (
             fetch_ui_resource,
@@ -1170,21 +1339,10 @@ class StreamCoordinator:
 
         if not is_mcp_apps_host_enabled():
             return []
+        if not tool_use_id or tool_use_id in emitted or not tool_name:
+            return []
 
         try:
-            tool_result = event.get("data", {}).get("tool_result", {})
-            if not isinstance(tool_result, dict):
-                return []
-            tool_use_id = tool_result.get("toolUseId") or tool_result.get(
-                "tool_use_id"
-            )
-            if not tool_use_id or tool_use_id in emitted:
-                return []
-
-            tool_name = tool_use_names.get(tool_use_id)
-            if not tool_name:
-                return []
-
             payload = await asyncio.to_thread(
                 fetch_ui_resource, tool_name, tool_use_id
             )
@@ -1192,9 +1350,108 @@ class StreamCoordinator:
                 return []
 
             emitted.add(tool_use_id)
+
+            # Persist for reload survival (best-effort). The `ui_resource`
+            # event is inline and never re-streams, so without this the
+            # `mcp-app-frame` falls back to a plain tool card after a refresh.
+            # Mirrors how artifacts persist + stamp from this same coordinator;
+            # the read side is the app-api messages endpoint's `uiResources`
+            # sidecar. Inert when the sessions-metadata table is absent (dev).
+            if session_id and user_id:
+                try:
+                    from apis.shared.mcp_apps.ui_resource_store import (
+                        get_ui_resource_store,
+                    )
+
+                    await asyncio.to_thread(
+                        get_ui_resource_store().store,
+                        user_id=user_id,
+                        session_id=session_id,
+                        tool_use_id=tool_use_id,
+                        resource_uri=payload.get("resourceUri", ""),
+                        html=payload.get("html", ""),
+                        mime_type=payload.get("mimeType", ""),
+                        csp=payload.get("csp", {}),
+                        permissions=payload.get("permissions", {}),
+                        sandbox_origin=payload.get("sandboxOrigin", ""),
+                        server_name=payload.get("serverName", ""),
+                        icon=payload.get("icon", ""),
+                        tool_name=payload.get("toolName", ""),
+                    )
+                except Exception:  # noqa: BLE001 - persistence is best-effort
+                    logger.warning(
+                        "Failed to persist ui_resource for reload "
+                        "(toolUseId=%s)",
+                        tool_use_id,
+                        exc_info=True,
+                    )
+
             return [f"event: ui_resource\ndata: {json.dumps(payload)}\n\n"]
         except Exception as e:  # noqa: BLE001 - best-effort side channel
             logger.warning("Failed to emit ui_resource event: %s", e)
+            return []
+
+    async def _extract_ui_resource_events(
+        self,
+        event: Dict[str, Any],
+        tool_use_names: Dict[str, str],
+        emitted: set,
+        session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> List[str]:
+        """Post-`tool_result` fallback emit of a tool's `ui_resource`.
+
+        Pulls the toolUseId from the tool_result and delegates to
+        `_emit_ui_resource_for_tool` (which dedupes against the early mount).
+        """
+        try:
+            tool_result = event.get("data", {}).get("tool_result", {})
+            if not isinstance(tool_result, dict):
+                return []
+            tool_use_id = tool_result.get("toolUseId") or tool_result.get(
+                "tool_use_id"
+            )
+            tool_name = tool_use_names.get(tool_use_id) if tool_use_id else None
+            return await self._emit_ui_resource_for_tool(
+                tool_name,
+                tool_use_id,
+                emitted,
+                session_id=session_id,
+                user_id=user_id,
+            )
+        except Exception as e:  # noqa: BLE001 - best-effort side channel
+            logger.warning("Failed to emit ui_resource event: %s", e)
+            return []
+
+    def _emit_tool_input_partial(
+        self, tool_use_id: str, accumulated: str
+    ) -> List[str]:
+        """Emit a `ui_tool_input_partial` SSE from accumulated input fragments.
+
+        Heals the streamed prefix of `toolUse.input` into the largest valid
+        object it can (`heal_partial_json`) and ships it as the SEP-1865
+        `tool-input-partial` payload, so an App that renders progressively
+        (e.g. Excalidraw's guided camera tour) animates as the model generates
+        the arguments. Skipped silently until the prefix heals to an object.
+        Best-effort — never raises into the stream.
+        """
+        from apis.shared.mcp_apps.partial_json import heal_partial_json
+
+        try:
+            args = heal_partial_json(accumulated)
+            if not args:
+                return []
+            payload = {
+                "type": "ui_tool_input_partial",
+                "toolUseId": tool_use_id,
+                "arguments": args,
+            }
+            return [
+                "event: ui_tool_input_partial\n"
+                f"data: {json.dumps(payload)}\n\n"
+            ]
+        except Exception as e:  # noqa: BLE001 - best-effort side channel
+            logger.warning("Failed to emit ui_tool_input_partial event: %s", e)
             return []
 
     def _format_sse_event(self, event: Dict[str, Any]) -> str:

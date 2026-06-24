@@ -1,0 +1,21 @@
+[project]
+name = "agentcore-restore-data"
+version = "1.0.0"
+description = "Restore tool for AgentCore Public Stack — reads a backup manifest and imports data into a deployed two-stack environment"
+requires-python = ">=3.13"
+dependencies = [
+    "boto3==1.43.9",
+    "botocore==1.43.9",
+]
+
+[dependency-groups]
+dev = [
+    "moto[dynamodb,s3,cognitoidp,ssm]==5.1.4",
+    "pytest==9.0.3",
+]
+
+[tool.uv]
+package = false
+
+# Security: constrain transitive cryptography to patched OpenSSL (GHSA-537c-gmf6-5ccf)
+constraint-dependencies = ["cryptography>=48.0.1"]

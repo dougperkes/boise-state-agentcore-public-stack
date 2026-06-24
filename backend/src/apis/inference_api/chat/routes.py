@@ -12,7 +12,7 @@ import json
 import logging
 import os
 import time
-from typing import AsyncGenerator, Union
+from typing import AsyncGenerator, Optional, Union
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -26,8 +26,11 @@ from apis.shared.errors import (
     ErrorCode,
     build_conversational_error_event,
 )
+from apis.shared.feature_flags import skills_enabled
 from apis.shared.files.file_resolver import get_file_resolver
 from apis.shared.models.managed_models import list_managed_models
+from apis.shared.platform_settings.models import DEFAULT_CHAT_MODE, ChatModeSettings
+from apis.shared.platform_settings.service import get_chat_mode_settings_service
 from apis.shared.quota import (
     QuotaExceededEvent,
     build_no_quota_configured_event,
@@ -49,6 +52,11 @@ from .app_context_dispatch import (
 from .app_tool_dispatch import AppToolCallError, dispatch_app_tool_call
 from .models import FileContent, InvocationRequest
 from .service import generate_conversation_title, get_agent
+from .system_prompt_resolver import (
+    append_active_prompt,
+    resolve_active_prompt_text,
+    should_resolve_custom_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +69,23 @@ router = APIRouter(tags=["agentcore-runtime"])
 
 # Preview session prefix - sessions with this prefix skip persistence
 PREVIEW_SESSION_PREFIX = "preview-"
+
+# Default agent factory variant for a user turn when the client doesn't pin one
+# (PR-7). Flipped from "chat" to "skill": every turn now routes through the
+# SkillAgent's progressive disclosure, which folds a granted skill's bound tools
+# behind the two meta-tools. Safe by construction — a user with zero accessible
+# skills gets a SkillAgent that degrades to plain ChatAgent behavior
+# (skill_agent.py), so this is a no-op for them. Clients can still opt out per
+# turn by sending agent_type="chat". (The lower-level service.get_agent keeps a
+# conservative "chat" fallback for direct/programmatic callers that don't
+# resolve skills; this request-policy default lives here.)
+#
+# Since the skills-mode work (docs/specs/skills-mode.md) the *runtime* default
+# comes from the admin-managed chat-mode policy (apis.shared.platform_settings),
+# which also decides whether a client agent_type override is honored at all —
+# see _resolve_effective_agent_type. This constant is the compiled-in fallback
+# the policy model itself defaults to, kept aliased so they can never drift.
+DEFAULT_AGENT_TYPE = DEFAULT_CHAT_MODE
 
 
 def is_preview_session(session_id: str) -> bool:
@@ -266,16 +291,19 @@ async def _resolve_model_settings(
     model_id: str | None,
     explicit_caching_enabled: bool | None,
     request_inference_params: dict | None,
-) -> tuple[bool | None, dict]:
+) -> tuple[bool | None, dict, str | None]:
     """Resolve runtime model knobs from the managed-model registry.
 
-    Returns ``(caching_enabled, inference_params)``. A single registry lookup
-    drives both, replacing the prior per-concern lookups.
+    Returns ``(caching_enabled, inference_params, mantle_endpoint_path)``. A
+    single registry lookup drives all three. ``mantle_endpoint_path`` is the
+    server-authoritative Bedrock Mantle path recorded on the model (``/v1`` or
+    ``/openai/v1``); ``None`` for non-Mantle models. Resolving it here keeps
+    the path off the client request — the SPA can't override it.
     """
     request_params = dict(request_inference_params or {})
 
     if not model_id:
-        return explicit_caching_enabled, request_params
+        return explicit_caching_enabled, request_params, None
 
     managed_model = await _find_managed_model(model_id)
 
@@ -286,13 +314,19 @@ async def _resolve_model_settings(
     else:
         caching = None
 
+    mantle_endpoint_path = (
+        getattr(managed_model, "mantle_endpoint_path", None)
+        if managed_model is not None
+        else None
+    )
+
     inference_params = _merge_inference_params(managed_model, request_params)
-    return caching, inference_params
+    return caching, inference_params, mantle_endpoint_path
 
 
 async def _resolve_caching_enabled(model_id: str | None, explicit_caching_enabled: bool | None) -> bool | None:
     """Backward-compat wrapper around :func:`_resolve_model_settings`."""
-    caching, _ = await _resolve_model_settings(model_id, explicit_caching_enabled, None)
+    caching, _, _ = await _resolve_model_settings(model_id, explicit_caching_enabled, None)
     return caching
 
 
@@ -605,29 +639,22 @@ async def stream_conversational_message(
         logger.info("Preview session - skipping message persistence")
         return
 
-    # Save messages to session for persistence
+    # Persist user + assistant turns. Unlike the streaming error paths in
+    # stream_coordinator (which persist assistant-only because the agent
+    # loop's MessageAddedEvent hook already wrote the user turn), this
+    # path fires BEFORE any agent run — quota-exceeded short-circuits,
+    # etc. — so no hook has persisted the user turn yet.
     try:
-        from strands.types.content import Message
-        from strands.types.session import SessionMessage
+        from agents.main_agent.session.persistence import persist_synthetic_messages
 
         session_manager = SessionFactory.create_session_manager(session_id=session_id, user_id=user_id, caching_enabled=False)
+        persist_synthetic_messages(
+            session_manager,
+            session_id,
+            [("user", user_input), ("assistant", message)],
+        )
 
-        # Save user message
-        user_message: Message = {"role": "user", "content": [{"text": user_input}]}
-
-        # Save assistant message
-        assistant_message: Message = {"role": "assistant", "content": [{"text": message}]}
-
-        # Use base_manager's create_message for persistence (AgentCore Memory)
-        if hasattr(session_manager, "base_manager") and hasattr(session_manager.base_manager, "create_message"):
-            user_session_msg = SessionMessage.from_message(user_message, index=0)
-            assistant_session_msg = SessionMessage.from_message(assistant_message, index=1)
-
-            session_manager.base_manager.create_message(session_id, "default", user_session_msg)
-            session_manager.base_manager.create_message(session_id, "default", assistant_session_msg)
-            logger.info("Saved messages to session")
-
-    except Exception as e:
+    except Exception:
         logger.error("Failed to save messages to session", exc_info=True)
 
 
@@ -658,6 +685,62 @@ async def ping():
     }
 
 
+async def _resolve_accessible_skill_ids(current_user: User) -> list[str]:
+    """Resolve the skills a user's RBAC roles grant (admin/DB-backed).
+
+    Thin delegate to the shared resolver (``apis.shared.skills.access``) used
+    by both this path and the user-facing skills API, so the picker and the
+    runtime can never drift. Kept as a module-level seam for tests. Never
+    raises — on any failure the user simply gets no skills (the SkillAgent
+    degrades to chat).
+    """
+    from apis.shared.skills.access import resolve_accessible_skill_ids
+
+    return await resolve_accessible_skill_ids(current_user)
+
+
+def _resolve_effective_agent_type(
+    requested: Optional[str], settings: ChatModeSettings
+) -> str:
+    """Apply the admin chat-mode policy to a client's requested agent type.
+
+    The client's choice between "skill" and "chat" is honored only while the
+    policy allows mode toggling; otherwise the admin default wins (UI gating
+    alone is not enforcement — the SPA hides the toggle, but any client can
+    craft a request). Other values ("voice", future internal types) pass
+    through untouched: the policy governs the user-facing mode pair only.
+    """
+    if (
+        requested in ("skill", "chat")
+        and requested != settings.default_mode
+        and not settings.allow_mode_toggle
+    ):
+        logger.info(
+            "Client agent_type=%s overridden to %s (mode toggling disabled by admin)",
+            requested,
+            settings.default_mode,
+        )
+        requested = None
+    return requested or settings.default_mode
+
+
+def _apply_enabled_skills_filter(
+    accessible_skill_ids: list[str], enabled_skills: Optional[list[str]]
+) -> list[str]:
+    """Narrow the RBAC-accessible skill set by the client's per-turn selection.
+
+    ``None`` means the client predates (or isn't using) the skills picker —
+    all accessible skills stay active, the pre-picker behavior. A list is an
+    intersection: client input can narrow the set, never grant. The result
+    stays a list (possibly empty) because SkillAgent distinguishes [] (DB
+    mode, zero skills → degrade to chat) from None (file-scan fallback).
+    """
+    if enabled_skills is None:
+        return accessible_skill_ids
+    requested = set(enabled_skills)
+    return [sid for sid in accessible_skill_ids if sid in requested]
+
+
 @router.post("/invocations")
 async def invocations(request: InvocationRequest, current_user: User = Depends(get_current_user_trusted)):
     """
@@ -679,6 +762,35 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
     # they bypass quota, file resolution, and RAG augmentation because those
     # already ran on the original turn that got paused.
     is_resume = bool(input_data.interrupt_responses)
+    # Resolve the effective agent type once: the client's explicit choice
+    # (honored only while the admin chat-mode policy allows toggling), else
+    # the policy's default mode. Used for the skill resolution below and the
+    # non-resume get_agent calls (resume reuses the snapshot's type). The
+    # settings read is TTL-cached in-process (~60s) and degrades to compiled-in
+    # defaults, so this adds no per-turn Dynamo cost and can't fail the turn.
+    chat_mode_settings = await get_chat_mode_settings_service().get_settings()
+    effective_agent_type = _resolve_effective_agent_type(
+        input_data.agent_type, chat_mode_settings
+    )
+    # Skills feature deferred for this environment: never route a turn through
+    # the SkillAgent, regardless of the client's request or any stored policy.
+    # Only the skill mode is neutralized — voice and other agent types pass
+    # through untouched.
+    if not skills_enabled() and effective_agent_type == "skill":
+        effective_agent_type = "chat"
+    # Resolve the user's *effective* skills once for the whole request — only
+    # for the skill agent path: the RBAC-accessible set (admin/DB-backed),
+    # narrowed by the client's per-turn enabled_skills selection. Threaded into
+    # every get_agent call below so they share one skills_hash cache key
+    # (otherwise the app-tool-call / resume paths would miss the main turn's
+    # cached SkillAgent). An explicit agent_type="chat" opts out and stays free
+    # of the extra reads.
+    effective_skill_ids = None
+    if effective_agent_type == "skill":
+        effective_skill_ids = _apply_enabled_skills_filter(
+            await _resolve_accessible_skill_ids(current_user),
+            input_data.enabled_skills,
+        )
     # A "Continue" after a max_tokens truncation. Like resume, it bypasses
     # quota / RAG / file resolution and does NOT clear the turn state; unlike
     # resume there is no interrupt to validate — the agent is rebuilt from the
@@ -702,7 +814,7 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
         atc = input_data.app_tool_call
         try:
             request_inference_params = dict(input_data.inference_params or {})
-            caching_enabled, inference_params = await _resolve_model_settings(
+            caching_enabled, inference_params, mantle_endpoint_path = await _resolve_model_settings(
                 model_id=input_data.model_id,
                 explicit_caching_enabled=input_data.caching_enabled,
                 request_inference_params=request_inference_params,
@@ -717,8 +829,10 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                 caching_enabled=caching_enabled,
                 provider=input_data.provider,
                 inference_params=inference_params,
-                agent_type=input_data.agent_type,
+                mantle_endpoint_path=mantle_endpoint_path,
+                agent_type=effective_agent_type,
                 is_resume=False,
+                accessible_skill_ids=effective_skill_ids,
             )
             payload = await dispatch_app_tool_call(
                 agent,
@@ -747,7 +861,7 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
         acu = input_data.app_context_update
         try:
             request_inference_params = dict(input_data.inference_params or {})
-            caching_enabled, inference_params = await _resolve_model_settings(
+            caching_enabled, inference_params, mantle_endpoint_path = await _resolve_model_settings(
                 model_id=input_data.model_id,
                 explicit_caching_enabled=input_data.caching_enabled,
                 request_inference_params=request_inference_params,
@@ -762,8 +876,10 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                 caching_enabled=caching_enabled,
                 provider=input_data.provider,
                 inference_params=inference_params,
-                agent_type=input_data.agent_type,
+                mantle_endpoint_path=mantle_endpoint_path,
+                agent_type=effective_agent_type,
                 is_resume=False,
+                accessible_skill_ids=effective_skill_ids,
             )
             payload = dispatch_app_context_update(
                 agent,
@@ -820,6 +936,35 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
         except Exception:
             logger.warning("Failed to resolve file upload IDs", exc_info=True)
             # Continue without files rather than failing the request
+
+    # Deduplicate files by (filename, content_type) before partitioning.
+    # The same file can arrive via both `files` (direct base64) and
+    # `file_upload_ids` (resolved from S3), or a client may submit the same
+    # upload ID twice. Sending two document blocks with the same sanitized
+    # name to Bedrock ConverseStream raises:
+    #   ValidationException: Messages can't contain duplicate document names.
+    # We keep the first occurrence and drop subsequent duplicates.
+    if all_files:
+        seen_file_keys: set = set()
+        deduped_files = []
+        for f in all_files:
+            key = (f.filename.lower(), f.content_type.lower())
+            if key not in seen_file_keys:
+                seen_file_keys.add(key)
+                deduped_files.append(f)
+            else:
+                logger.info(
+                    "Dropping duplicate file attachment: %s (%s)",
+                    f.filename,
+                    f.content_type,
+                )
+        if len(deduped_files) < len(all_files):
+            logger.info(
+                "Deduplicated %d -> %d file(s) before sending to Bedrock",
+                len(all_files),
+                len(deduped_files),
+            )
+        all_files = deduped_files
 
     files_to_send, diverted_tabular, oversized_inline = _partition_attachments(all_files)
     if diverted_tabular:
@@ -960,6 +1105,14 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
         logger.info("Assistant RAG requested")
         logger.info("Processing for authenticated user")
 
+        # Assistants are KB-grounded with no external tools available to the consumer.
+        # Override any tools the client sent — server is the source of truth here.
+        if input_data.enabled_tools:
+            logger.warning(
+                "Ignoring enabled_tools on assistant chat (assistants are KB-only)"
+            )
+        input_data.enabled_tools = []
+
         # 1. Check if session already has an assistant attached
         # If it does, verify it's the same assistant (can't change assistants mid-session)
         # If it doesn't, verify session has no messages (can only attach to new sessions)
@@ -1004,7 +1157,9 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
 
         # 2. Load assistant with access check
         logger.info("Loading assistant with access check...")
-        assistant = await get_assistant_with_access_check(assistant_id=input_data.rag_assistant_id, user_id=user_id, user_email=current_user.email)
+        assistant, _ = await get_assistant_with_access_check(
+            assistant_id=input_data.rag_assistant_id, user_id=user_id, user_email=current_user.email
+        )
 
         if not assistant:
             logger.warning("get_assistant_with_access_check returned None")
@@ -1068,6 +1223,13 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
         preview_instructions_override = input_data.system_prompt if is_preview_session(input_data.session_id) and input_data.system_prompt else None
         effective_instructions = preview_instructions_override or assistant.instructions
 
+        kb_grounding_directive = (
+            "## Knowledge Base Grounding\n\n"
+            "Answer using only the knowledge base context provided with the user's message. "
+            "If the context does not cover the question, say so plainly rather than guessing. "
+            "You have no external tools available."
+        )
+
         if effective_instructions:
             # Import here to avoid circular dependency
             from agents.main_agent.core.system_prompt_builder import SystemPromptBuilder
@@ -1077,7 +1239,7 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
             base_prompt = base_prompt_builder.build(include_date=True)
 
             # Append assistant instructions to the base prompt
-            system_prompt = f"{base_prompt}\n\n## Assistant-Specific Instructions\n\n{effective_instructions}"
+            system_prompt = f"{base_prompt}\n\n{kb_grounding_directive}\n\n## Assistant-Specific Instructions\n\n{effective_instructions}"
             if preview_instructions_override:
                 logger.info(
                     "Using live preview instructions override"
@@ -1090,13 +1252,13 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
         else:
             # No assistant instructions - use base prompt if no system_prompt provided
             logger.warning("No instructions found on assistant!")
-            if not system_prompt:
-                from agents.main_agent.core.system_prompt_builder import SystemPromptBuilder
+            from agents.main_agent.core.system_prompt_builder import SystemPromptBuilder
 
-                base_prompt_builder = SystemPromptBuilder()
-                system_prompt = base_prompt_builder.build(include_date=True)
+            base_prompt_builder = SystemPromptBuilder()
+            base_prompt = base_prompt_builder.build(include_date=True)
+            system_prompt = f"{base_prompt}\n\n{kb_grounding_directive}"
             logger.info(
-                "Assistant has no instructions - using fallback system prompt"
+                "Assistant has no instructions - using fallback system prompt with KB grounding"
             )
 
         # 6. Save assistant_id to session preferences (persist for future loads)
@@ -1155,6 +1317,30 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
         else:
             logger.info("Preview session - skipping assistant_id persistence")
 
+    # Append active custom system prompt (if any). Gating rules + lookup live
+    # in `system_prompt_resolver.py` so they can be unit-tested independently
+    # of the route.
+    if should_resolve_custom_prompt(
+        is_resume=is_resume,
+        is_continuation=is_continuation,
+        is_preview=is_preview_session(input_data.session_id),
+        has_assistant=bool(input_data.rag_assistant_id),
+    ):
+        resolved = await resolve_active_prompt_text(
+            session_id=input_data.session_id,
+            user_id=user_id,
+            request_prompt_id=input_data.selected_prompt_id,
+        )
+        if resolved:
+            prompt_name, prompt_text = resolved
+            # Build the base system prompt if not already built (no-assistant
+            # path can leave system_prompt unset).
+            if not system_prompt:
+                from agents.main_agent.core.system_prompt_builder import SystemPromptBuilder
+                system_prompt = SystemPromptBuilder().build(include_date=True)
+            system_prompt = append_active_prompt(system_prompt, prompt_name, prompt_text)
+            logger.info(f"Appended custom system prompt: {prompt_name!r}")
+
     try:
         # Resume requests rebuild the agent from the persisted PausedTurnSnapshot
         # so a refresh / cache eviction / pod restart between pause and resume
@@ -1207,8 +1393,27 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                 caching_enabled=snapshot.caching_enabled,
                 provider=snapshot.provider,
                 inference_params=resume_inference_params,
+                mantle_endpoint_path=snapshot.mantle_endpoint_path,
                 agent_type=snapshot.agent_type,
                 is_resume=True,
+                # Resume must rebuild the SAME cache key the original turn used,
+                # or the paused agent is orphaned. The original turn's
+                # skills_hash was derived from its *effective* skill set only
+                # when it was a skill turn; mirror that off the snapshot's type
+                # (a turn explicitly built as "chat" carried no skills → empty
+                # skills_hash). New snapshots carry that exact set in
+                # enabled_skills; legacy snapshots (written before the field
+                # existed) fall back to this request's resolution, the
+                # pre-skills-picker behavior.
+                accessible_skill_ids=(
+                    (
+                        snapshot.enabled_skills
+                        if snapshot.enabled_skills is not None
+                        else effective_skill_ids
+                    )
+                    if snapshot.agent_type == "skill"
+                    else None
+                ),
             )
         else:
             # Build the canonical request inference-params dict. The frontend
@@ -1245,9 +1450,10 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                             "User default model exists but RBAC denies access; falling back to system default"
                         )
 
-            # Single registry lookup resolves caching + inference params,
-            # merging admin defaults with request overrides.
-            caching_enabled, inference_params = await _resolve_model_settings(
+            # Single registry lookup resolves caching + inference params +
+            # the Mantle endpoint path, merging admin defaults with request
+            # overrides.
+            caching_enabled, inference_params, mantle_endpoint_path = await _resolve_model_settings(
                 model_id=effective_model_id,
                 explicit_caching_enabled=input_data.caching_enabled,
                 request_inference_params=request_inference_params,
@@ -1287,9 +1493,11 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                 caching_enabled=caching_enabled,
                 provider=effective_provider,
                 inference_params=inference_params,
-                agent_type=input_data.agent_type,
+                mantle_endpoint_path=mantle_endpoint_path,
+                agent_type=effective_agent_type,
                 extra_tools=extra_tools,
                 is_resume=False,
+                accessible_skill_ids=effective_skill_ids,
             )
 
         # Resume requests must target interrupts that the cached agent

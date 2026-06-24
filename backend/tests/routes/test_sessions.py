@@ -232,6 +232,10 @@ class TestUpdateSessionMetadata:
             new_callable=AsyncMock,
             return_value=None,
         ), patch(
+            "apis.app_api.sessions.routes.session_exists_for_other_user",
+            new_callable=AsyncMock,
+            return_value=False,
+        ), patch(
             "apis.app_api.sessions.routes.store_session_metadata",
             new_callable=AsyncMock,
         ):
@@ -243,6 +247,286 @@ class TestUpdateSessionMetadata:
         assert resp.status_code == 200
         body = resp.json()
         assert body["title"] == "Brand New Session"
+
+    def test_rejects_disabled_prompt(self, app, make_user, authenticated_client):
+        """A disabled prompt cannot be selected — 400."""
+        user = make_user()
+        client = authenticated_client(app, user)
+
+        # Service returns None (None for missing OR disabled).
+        mock_service = MagicMock()
+        mock_service.get_enabled_prompt = AsyncMock(return_value=None)
+
+        with patch(
+            "apis.app_api.sessions.routes.get_system_prompts_service",
+            return_value=mock_service,
+        ):
+            resp = client.put(
+                "/sessions/sess-001/metadata",
+                json={"selectedPromptId": "disabled-prompt"},
+            )
+
+        assert resp.status_code == 400
+        assert "not found or not enabled" in resp.json()["detail"]
+
+    def test_null_selected_prompt_clears_selection(self, app, make_user, authenticated_client):
+        """Sending selectedPromptId: null clears the persisted selection."""
+        from apis.shared.sessions.models import SessionPreferences
+        user = make_user()
+        client = authenticated_client(app, user)
+
+        existing = _make_session_metadata("sess-001", user.user_id)
+        existing.preferences = SessionPreferences(selected_prompt_id="some-old-id")
+
+        captured = {}
+
+        async def capture_store(*, session_id, user_id, session_metadata):
+            captured["metadata"] = session_metadata
+
+        with patch(
+            "apis.app_api.sessions.routes.get_session_metadata",
+            new_callable=AsyncMock,
+            return_value=existing,
+        ), patch(
+            "apis.app_api.sessions.routes.store_session_metadata",
+            side_effect=capture_store,
+        ):
+            resp = client.put(
+                "/sessions/sess-001/metadata",
+                json={"selectedPromptId": None},
+            )
+
+        assert resp.status_code == 200
+        # The persisted preferences should have selected_prompt_id cleared.
+        assert captured["metadata"].preferences.selected_prompt_id is None
+
+    def test_omitted_selected_prompt_leaves_selection_unchanged(self, app, make_user, authenticated_client):
+        """Omitting selectedPromptId entirely must not clear the existing value."""
+        from apis.shared.sessions.models import SessionPreferences
+        user = make_user()
+        client = authenticated_client(app, user)
+
+        existing = _make_session_metadata("sess-001", user.user_id)
+        existing.preferences = SessionPreferences(selected_prompt_id="keep-me")
+
+        captured = {}
+
+        async def capture_store(*, session_id, user_id, session_metadata):
+            captured["metadata"] = session_metadata
+
+        with patch(
+            "apis.app_api.sessions.routes.get_session_metadata",
+            new_callable=AsyncMock,
+            return_value=existing,
+        ), patch(
+            "apis.app_api.sessions.routes.store_session_metadata",
+            side_effect=capture_store,
+        ):
+            # Update title only — no selectedPromptId field at all.
+            resp = client.put(
+                "/sessions/sess-001/metadata",
+                json={"title": "New title"},
+            )
+
+        assert resp.status_code == 200
+        assert captured["metadata"].preferences.selected_prompt_id == "keep-me"
+
+    def test_agent_type_persists_and_merges(self, app, make_user, authenticated_client):
+        """agentType (skills-mode) lands in preferences without clobbering others."""
+        from apis.shared.sessions.models import SessionPreferences
+        user = make_user()
+        client = authenticated_client(app, user)
+
+        existing = _make_session_metadata("sess-001", user.user_id)
+        existing.preferences = SessionPreferences(selected_prompt_id="keep-me")
+
+        captured = {}
+
+        async def capture_store(*, session_id, user_id, session_metadata):
+            captured["metadata"] = session_metadata
+
+        with patch(
+            "apis.app_api.sessions.routes.get_session_metadata",
+            new_callable=AsyncMock,
+            return_value=existing,
+        ), patch(
+            "apis.app_api.sessions.routes.store_session_metadata",
+            side_effect=capture_store,
+        ):
+            resp = client.put(
+                "/sessions/sess-001/metadata",
+                json={"agentType": "chat"},
+            )
+
+        assert resp.status_code == 200
+        prefs = captured["metadata"].preferences
+        assert prefs.agent_type == "chat"
+        assert prefs.selected_prompt_id == "keep-me"
+
+    def test_agent_type_set_on_brand_new_session(self, app, make_user, authenticated_client):
+        """agentType alone is enough to create the preferences object."""
+        user = make_user()
+        client = authenticated_client(app, user)
+
+        captured = {}
+
+        async def capture_store(*, session_id, user_id, session_metadata):
+            captured["metadata"] = session_metadata
+
+        with patch(
+            "apis.app_api.sessions.routes.get_session_metadata",
+            new_callable=AsyncMock,
+            return_value=None,
+        ), patch(
+            "apis.app_api.sessions.routes.session_exists_for_other_user",
+            new_callable=AsyncMock,
+            return_value=False,
+        ), patch(
+            "apis.app_api.sessions.routes.store_session_metadata",
+            side_effect=capture_store,
+        ):
+            resp = client.put(
+                "/sessions/sess-new/metadata",
+                json={"agentType": "skill"},
+            )
+
+        assert resp.status_code == 200
+        assert captured["metadata"].preferences.agent_type == "skill"
+
+    def test_agent_type_rejects_unknown_mode(self, app, make_user, authenticated_client):
+        """agentType is constrained to the skill/chat mode pair."""
+        user = make_user()
+        client = authenticated_client(app, user)
+
+        resp = client.put(
+            "/sessions/sess-001/metadata",
+            json={"agentType": "voice"},
+        )
+        assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Session-metadata ownership: PUT cannot land on another user's session
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateSessionMetadataOwnership:
+    """PUT /sessions/{session_id}/metadata refuses to write when the session
+    already exists for a different user. Behaves like GET in that case —
+    returns 404 — so non-owners cannot enumerate session ids by probing."""
+
+    def test_returns_404_when_session_exists_for_another_user(
+        self, app, make_user, authenticated_client
+    ):
+        """The session id is taken; the caller is not its owner. 404."""
+        user = make_user(user_id="user-attacker")
+        client = authenticated_client(app, user)
+
+        with patch(
+            "apis.app_api.sessions.routes.get_session_metadata",
+            new_callable=AsyncMock,
+            return_value=None,
+        ), patch(
+            "apis.app_api.sessions.routes.session_exists_for_other_user",
+            new_callable=AsyncMock,
+            return_value=True,
+        ), patch(
+            "apis.app_api.sessions.routes.store_session_metadata",
+            new_callable=AsyncMock,
+        ) as mock_store:
+            resp = client.put(
+                "/sessions/victim-session-id/metadata",
+                json={"title": "IDOR-ATTEMPT"},
+            )
+
+        assert resp.status_code == 404
+        # And no write must have happened.
+        mock_store.assert_not_called()
+
+    def test_persists_no_data_when_existence_check_fails(
+        self, app, make_user, authenticated_client
+    ):
+        """If the existence check returns True the write must not run, even
+        if the per-user fetch returned None (the create-new path)."""
+        user = make_user(user_id="user-attacker")
+        client = authenticated_client(app, user)
+
+        with patch(
+            "apis.app_api.sessions.routes.get_session_metadata",
+            new_callable=AsyncMock,
+            return_value=None,
+        ), patch(
+            "apis.app_api.sessions.routes.session_exists_for_other_user",
+            new_callable=AsyncMock,
+            return_value=True,
+        ), patch(
+            "apis.app_api.sessions.routes.store_session_metadata",
+            new_callable=AsyncMock,
+        ) as mock_store:
+            client.put(
+                "/sessions/victim-session-id/metadata",
+                json={"title": "anything", "starred": True},
+            )
+
+        mock_store.assert_not_called()
+
+    def test_brand_new_session_id_creates_normally(
+        self, app, make_user, authenticated_client
+    ):
+        """When the session id is genuinely free, the create-new branch
+        still runs."""
+        user = make_user(user_id="u-1")
+        client = authenticated_client(app, user)
+
+        with patch(
+            "apis.app_api.sessions.routes.get_session_metadata",
+            new_callable=AsyncMock,
+            return_value=None,
+        ), patch(
+            "apis.app_api.sessions.routes.session_exists_for_other_user",
+            new_callable=AsyncMock,
+            return_value=False,
+        ), patch(
+            "apis.app_api.sessions.routes.store_session_metadata",
+            new_callable=AsyncMock,
+        ) as mock_store:
+            resp = client.put(
+                "/sessions/fresh-session-id/metadata",
+                json={"title": "First conversation"},
+            )
+
+        assert resp.status_code == 200
+        mock_store.assert_awaited_once()
+
+    def test_owner_update_does_not_invoke_existence_check(
+        self, app, make_user, authenticated_client
+    ):
+        """When the user already owns the session, the existence-check
+        helper is unnecessary — the per-user fetch returned a record."""
+        user = make_user(user_id="u-1")
+        client = authenticated_client(app, user)
+
+        existing = _make_session_metadata("owned-session", user.user_id)
+
+        with patch(
+            "apis.app_api.sessions.routes.get_session_metadata",
+            new_callable=AsyncMock,
+            return_value=existing,
+        ), patch(
+            "apis.app_api.sessions.routes.session_exists_for_other_user",
+            new_callable=AsyncMock,
+            return_value=False,
+        ) as exists_check, patch(
+            "apis.app_api.sessions.routes.store_session_metadata",
+            new_callable=AsyncMock,
+        ):
+            resp = client.put(
+                "/sessions/owned-session/metadata",
+                json={"title": "Renamed"},
+            )
+
+        assert resp.status_code == 200
+        exists_check.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

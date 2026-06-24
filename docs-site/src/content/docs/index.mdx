@@ -1,0 +1,60 @@
+---
+title: AgentCore Public Stack
+description: The unofficial frontend for Strands and AgentCore — a production-ready, multi-agent conversational AI platform on AWS Bedrock AgentCore.
+template: splash
+hero:
+  title: |
+    <span class="hero-kicker">Strands · AgentCore</span>
+    AgentCore Public Stack
+  image:
+    dark: ../../assets/globe-dark.svg
+    light: ../../assets/globe-light.svg
+    alt: AgentCore Public Stack logo
+  tagline: The unofficial frontend for Strands Agents and AWS Bedrock AgentCore.
+  actions:
+    - text: Get started
+      link: /agentcore-public-stack/getting-started/introduction/
+      icon: right-arrow
+      variant: primary
+    - text: View on GitHub
+      link: https://github.com/Boise-State-Development/agentcore-public-stack
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+A production-ready, multi-agent conversational AI platform built on **AWS Bedrock AgentCore** and **Strands Agents** — streaming chat, tools, RAG, MCP Apps, artifacts, and voice, wired together and ready to deploy.
+
+<CardGrid>
+	<LinkCard
+		title="Getting Started"
+		href="/agentcore-public-stack/getting-started/introduction/"
+		description="What the platform is, how it fits together, and how to run it locally."
+	/>
+	<LinkCard
+		title="Local Development"
+		href="/agentcore-public-stack/local-development/"
+		description="Run the backend and SPA locally against a deployed environment."
+	/>
+	<LinkCard
+		title="Deployment"
+		href="/agentcore-public-stack/deployment/overview/"
+		description="Ship to AWS: platform stack, backend images, and the frontend."
+	/>
+	<LinkCard
+		title="Features"
+		href="/agentcore-public-stack/features/agents/"
+		description="Agents, tools, MCP Apps, RAG, artifacts, voice, and SSE streaming."
+	/>
+	<LinkCard
+		title="MCP & Integrations"
+		href="/agentcore-public-stack/integrations/mcp-overview/"
+		description="Connect MCP servers, Gateway targets, and remote A2A agents."
+	/>
+	<LinkCard
+		title="Reference"
+		href="/agentcore-public-stack/reference/sse-event-types/"
+		description="SSE event types, service boundaries, and CLI commands."
+	/>
+</CardGrid>

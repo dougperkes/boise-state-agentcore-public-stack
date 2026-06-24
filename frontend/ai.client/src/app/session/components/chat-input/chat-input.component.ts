@@ -17,6 +17,7 @@ import {
   heroAdjustmentsHorizontal,
   heroClock,
   heroMicrophone,
+  heroXMark,
 } from '@ng-icons/heroicons/outline';
 import { heroPaperAirplaneSolid, heroStopSolid } from '@ng-icons/heroicons/solid';
 import { ModelDropdownComponent } from '../../../components/model-dropdown/model-dropdown.component';
@@ -35,6 +36,7 @@ import {
 import { ToastService } from '../../../services/toast/toast.service';
 import { ToolService } from '../../../services/tool/tool.service';
 import { VoiceChatService, type VoiceStatus } from '../../services/voice';
+import { SystemPromptsService } from '../../../services/system-prompts/system-prompts.service';
 
 interface Message {
   content: string;
@@ -51,6 +53,7 @@ interface Message {
       heroAdjustmentsHorizontal,
       heroClock,
       heroMicrophone,
+      heroXMark,
       heroStopSolid,
       heroPaperAirplaneSolid
     })
@@ -64,6 +67,7 @@ export class ChatInputComponent {
   private readonly toastService = inject(ToastService);
   private readonly toolService = inject(ToolService);
   private readonly voiceChatService = inject(VoiceChatService);
+  protected readonly systemPromptsService = inject(SystemPromptsService);
 
   // Input: session ID for file uploads
   readonly sessionId = input<string | null>(null);
@@ -73,6 +77,14 @@ export class ChatInputComponent {
 
   // Input: show file attachment controls (defaults to true)
   readonly showFileControls = input<boolean>(true);
+
+  // Input: show voice mode toggle (defaults to true). Disabled where voice
+  // is not meaningful, e.g. the assistant editor preview.
+  readonly showVoiceControl = input<boolean>(true);
+
+  // Input: show the settings/tools button (defaults to true). Disabled where
+  // the chat input isn't wired to a settings panel, e.g. the assistant editor preview.
+  readonly showSettingsControl = input<boolean>(true);
 
   // Input: auto-focus the textarea on load and session change (defaults to true).
   // Disabled where the input sits beside an editable form (e.g. assistant preview).
@@ -217,6 +229,15 @@ export class ChatInputComponent {
 
   toggleSettings() {
     this.settingsToggled.emit();
+  }
+
+  dismissActivePrompt(): void {
+    const sid = this.sessionId();
+    this.systemPromptsService.setActivePrompt(sid, null)
+      .catch(err => {
+        console.error('Failed to clear prompt selection:', err);
+        this.toastService.error('Could not clear conversation mode', 'Please try again.');
+      });
   }
 
   async toggleVoice() {

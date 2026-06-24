@@ -5,9 +5,10 @@ Requires admin role (Admin or SuperAdmin) via JWT token.
 """
 
 from fastapi import APIRouter, HTTPException, Depends, Query, status
-from typing import Optional
+from typing import Literal, Optional
 import logging
 import os
+import re
 import boto3
 from botocore.exceptions import ClientError, BotoCoreError
 
@@ -18,6 +19,8 @@ from .models import (
     GeminiModelSummary,
     OpenAIModelsResponse,
     OpenAIModelSummary,
+    MantleModelsResponse,
+    MantleModelSummary,
     ManagedModelsListResponse,
 )
 from apis.shared.models.models import (
@@ -26,6 +29,7 @@ from apis.shared.models.models import (
     ManagedModel,
 )
 from apis.shared.auth import User, require_admin
+from apis.shared.feature_flags import skills_enabled
 from apis.shared.sessions.metadata import list_user_sessions, get_session_metadata
 from apis.shared.sessions.messages import get_messages
 from apis.shared.models.managed_models import (
@@ -44,12 +48,40 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 
 
 
+# AWS Bedrock's accepted shape for byProvider — alphanumerics, hyphens, and
+# spaces, 1-63 chars. Validating client-side keeps obviously-malformed input
+# (HTML, control chars, oversized strings) from reaching the AWS API at all.
+_BEDROCK_PROVIDER_RE = re.compile(r"^[A-Za-z0-9 -]{1,63}$")
+
+
 @router.get("/bedrock/models", response_model=BedrockModelsResponse)
 async def list_bedrock_models(
-    by_provider: Optional[str] = Query(None, description="Filter by provider name (e.g., 'Anthropic', 'Amazon')"),
-    by_output_modality: Optional[str] = Query(None, description="Filter by output modality (e.g., 'TEXT', 'IMAGE')"),
-    by_inference_type: Optional[str] = Query(None, description="Filter by inference type (e.g., 'ON_DEMAND', 'PROVISIONED')"),
-    by_customization_type: Optional[str] = Query(None, description="Filter by customization type (e.g., 'FINE_TUNING', 'CONTINUED_PRE_TRAINING')"),
+    by_provider: Optional[str] = Query(
+        None,
+        regex=_BEDROCK_PROVIDER_RE.pattern,
+        description="Filter by provider name (e.g., 'Anthropic', 'Amazon')",
+    ),
+    by_output_modality: Optional[
+        Literal["SPEECH", "TEXT", "EMBEDDING", "VIDEO", "IMAGE"]
+    ] = Query(None, description="Filter by output modality"),
+    by_inference_type: Optional[
+        Literal[
+            "INFERENCE_PROFILE",
+            "ON_DEMAND",
+            "MODEL_GATEWAY",
+            "PROVISIONED",
+            "PROVISIONED_THROUGHPUT",
+        ]
+    ] = Query(None, description="Filter by inference type"),
+    by_customization_type: Optional[
+        Literal[
+            "REINFORCEMENT_FINE_TUNING",
+            "DISTILLATION",
+            "PREFERENCE_FINE_TUNING",
+            "CONTINUED_PRE_TRAINING",
+            "FINE_TUNING",
+        ]
+    ] = Query(None, description="Filter by customization type"),
     max_results: Optional[int] = Query(None, ge=1, le=1000, description="Maximum number of models to return (client-side limit)"),
     admin_user: User = Depends(require_admin),
 ):
@@ -144,26 +176,21 @@ async def list_bedrock_models(
             totalCount=len(model_summaries),
         )
 
-    except ClientError as e:
-        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
-        error_message = e.response.get('Error', {}).get('Message', str(e))
-        logger.error("AWS Bedrock API error", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"AWS Bedrock API error: {error_code} - {error_message}"
-        )
-    except BotoCoreError as e:
+    except HTTPException:
+        raise
+    except BotoCoreError:
+        # Connectivity / config error talking to AWS. Generic 502;
+        # full traceback is logged by the global handler chain.
         logger.error("Boto3 error calling Bedrock API", exc_info=True)
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error connecting to AWS Bedrock: {str(e)}"
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Upstream service error.",
         )
-    except Exception as e:
-        logger.error("Unexpected error listing Bedrock models", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Unexpected error: {str(e)}"
-        )
+    # ClientError is intentionally not caught here — the app-wide
+    # ``register_aws_client_error_handler`` maps ValidationException-class
+    # codes to a generic 400 and other ClientErrors to a generic 502
+    # without echoing the AWS message back. Catching here would re-surface
+    # the AWS message, the user input, and AWS-internal pattern detail.
 
 
 @router.get("/gemini/models", response_model=GeminiModelsResponse)
@@ -197,10 +224,13 @@ async def list_gemini_models(
         # Try both GOOGLE_API_KEY and GOOGLE_GEMINI_API_KEY for compatibility
         google_api_key = os.environ.get('GOOGLE_API_KEY') or os.environ.get('GOOGLE_GEMINI_API_KEY')
         if not google_api_key:
-            logger.error("GOOGLE_API_KEY or GOOGLE_GEMINI_API_KEY environment variable not set")
+            logger.error(
+                "External Gemini provider not configured "
+                "(set GOOGLE_API_KEY or GOOGLE_GEMINI_API_KEY)"
+            )
             raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Google API key not configured. Please set GOOGLE_API_KEY or GOOGLE_GEMINI_API_KEY environment variable."
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="External model provider not configured.",
             )
 
         # Import Google AI SDK
@@ -309,10 +339,12 @@ async def list_openai_models(
         # Check if OpenAI API key is configured
         openai_api_key = os.environ.get('OPENAI_API_KEY')
         if not openai_api_key:
-            logger.error("OPENAI_API_KEY environment variable not set")
+            logger.error(
+                "External OpenAI provider not configured (set OPENAI_API_KEY)"
+            )
             raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="OpenAI API key not configured. Please set OPENAI_API_KEY environment variable."
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="External model provider not configured.",
             )
 
         # Import OpenAI SDK
@@ -365,6 +397,107 @@ async def list_openai_models(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error fetching OpenAI models: {str(e)}"
+        )
+
+
+@router.get("/mantle/models", response_model=MantleModelsResponse)
+async def list_mantle_models(
+    region: Optional[str] = Query(None, description="AWS region to query (defaults to the service region)"),
+    max_results: Optional[int] = Query(None, ge=1, le=1000, description="Maximum number of models to return"),
+    admin_user: User = Depends(require_admin),
+):
+    """
+    List available Amazon Bedrock Mantle models (admin only).
+
+    Bedrock Mantle is AWS's OpenAI-compatible inference surface for
+    Bedrock-hosted models. Discovery is the standard OpenAI `GET /v1/models`
+    against `https://bedrock-mantle.<region>.api.aws/v1`, authenticated with
+    a short-term bearer token minted from this service's IAM credentials
+    (requires `bedrock:CallWithBearerToken`). The roster is regional, so the
+    optional `region` filter lets admins browse other regions.
+
+    Args:
+        region: Optional AWS region override (defaults to AWS_REGION)
+        max_results: Optional limit on number of models to return
+        admin_user: Authenticated admin user (injected by dependency)
+
+    Returns:
+        MantleModelsResponse with the models available in the region
+
+    Raises:
+        HTTPException:
+            - 401 if not authenticated
+            - 403 if user lacks admin role
+            - 500 if token minting or the Mantle API call fails
+    """
+    logger.info("Admin listing Bedrock Mantle models")
+
+    try:
+        from apis.shared.bedrock import (
+            generate_bedrock_bearer_token,
+            get_mantle_base_url,
+        )
+
+        # Import OpenAI SDK (Mantle speaks the OpenAI wire protocol)
+        try:
+            from openai import OpenAI
+        except ImportError:
+            logger.error("OpenAI SDK not installed")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="OpenAI SDK not installed. Please install openai package."
+            )
+
+        resolved_region = region or os.environ.get('AWS_REGION', 'us-east-1')
+        base_url = get_mantle_base_url(resolved_region)
+        bearer_token = generate_bedrock_bearer_token(resolved_region)
+
+        client = OpenAI(base_url=base_url, api_key=bearer_token)
+
+        logger.debug("Fetching Mantle models")
+        all_models = []
+        response = client.models.list()
+        for model in response.data:
+            all_models.append(
+                MantleModelSummary(
+                    id=model.id,
+                    created=getattr(model, 'created', None),
+                    ownedBy=getattr(model, 'owned_by', '') or '',
+                    object=getattr(model, 'object', None),
+                )
+            )
+
+        # Sort by id for a stable roster (Mantle ids are provider-prefixed,
+        # so this groups models by upstream provider).
+        all_models.sort(key=lambda m: m.id)
+
+        if max_results and len(all_models) > max_results:
+            all_models = all_models[:max_results]
+            logger.debug("Limited results to max_results models")
+
+        logger.info("✅ Retrieved Bedrock Mantle models")
+
+        return MantleModelsResponse(
+            models=all_models,
+            region=resolved_region,
+            totalCount=len(all_models),
+        )
+
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except ValueError as e:
+        # Credential resolution failure from the token generator
+        logger.error("Failed to mint Bedrock bearer token", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error minting Bedrock bearer token: {str(e)}"
+        )
+    except Exception as e:
+        logger.error("Unexpected error listing Mantle models", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error fetching Bedrock Mantle models: {str(e)}"
         )
 
 
@@ -716,10 +849,24 @@ from .tools.routes import router as tools_router
 
 router.include_router(tools_router)
 
+# ========== Include Skills Admin Subrouter (conditional) ==========
+# Skills feature deferred to a later release; off by default. While off the
+# admin catalog API is unmounted so the surface 404s, but the data and code
+# remain intact.
+if skills_enabled():
+    from .skills.routes import router as skills_router
+
+    router.include_router(skills_router)
+
 # ========== Include OAuth Admin Subrouter ==========
 from .oauth.routes import router as oauth_admin_router
 
 router.include_router(oauth_admin_router)
+
+# ========== Include File-Source Adapters Admin Subrouter ==========
+from .file_sources.routes import router as file_sources_admin_router
+
+router.include_router(file_sources_admin_router)
 
 # ========== Include Auth Providers Admin Subrouter ==========
 from .auth_providers.routes import router as auth_providers_router
@@ -730,6 +877,19 @@ router.include_router(auth_providers_router)
 from .user_menu_links.routes import router as user_menu_links_admin_router
 
 router.include_router(user_menu_links_admin_router)
+
+# ========== Include System Prompts Admin Subrouter ==========
+from .system_prompts.routes import router as system_prompts_admin_router
+
+router.include_router(system_prompts_admin_router)
+
+# ========== Include Platform Settings Admin Subrouter (conditional) ==========
+# Currently only hosts the chat-mode (skills vs. tools) policy, which is part
+# of the deferred skills feature. Mount it only when skills are enabled.
+if skills_enabled():
+    from .settings.routes import router as settings_admin_router
+
+    router.include_router(settings_admin_router)
 
 # ========== Include Fine-Tuning Admin Subrouter (conditional) ==========
 if os.environ.get("FINE_TUNING_ENABLED", "false").lower() == "true":

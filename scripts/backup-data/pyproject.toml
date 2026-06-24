@@ -11,8 +11,11 @@ dependencies = [
 [dependency-groups]
 dev = [
     "moto[dynamodb,s3,cognitoidp,ssm]==5.1.4",
-    "pytest==8.4.2",
+    "pytest==9.0.3",
 ]
 
 [tool.uv]
 package = false
+
+# Security: constrain transitive cryptography to patched OpenSSL (GHSA-537c-gmf6-5ccf)
+constraint-dependencies = ["cryptography>=48.0.1"]

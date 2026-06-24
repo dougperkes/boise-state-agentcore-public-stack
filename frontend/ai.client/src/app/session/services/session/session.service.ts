@@ -5,6 +5,7 @@ import { ConfigService } from '../../../services/config.service';
 import { SessionService as BffSessionService } from '../../../auth/session.service';
 import { SessionMetadata, UpdateSessionMetadataRequest } from '../models/session-metadata.model';
 import { Message } from '../models/message.model';
+import type { UiResourceEvent } from '../../../shared/utils/stream-parser';
 
 /**
  * Query parameters for listing sessions.
@@ -72,6 +73,12 @@ export interface MessagesListResponse {
   nextToken: string | null;
   /** OAuth consent interrupts that paused agent turns and are awaiting user action */
   pendingInterrupts?: PendingInterrupt[];
+  /**
+   * Persisted MCP App UI resources (SEP-1865), each shaped like the inline
+   * `ui_resource` SSE event. Replayed on load to re-seed McpAppStateService
+   * so the `mcp-app-frame` survives a refresh. Present only on the first page.
+   */
+  uiResources?: UiResourceEvent[];
 }
 
 /**
@@ -539,7 +546,6 @@ export class SessionService {
     sessionId: string,
     updates: UpdateSessionMetadataRequest
   ): Promise<SessionMetadata> {
-    // Ensure user is authenticated before making the request
     try {
       const response = await firstValueFrom(
         this.http.put<SessionMetadata>(
@@ -548,7 +554,10 @@ export class SessionService {
         )
       );
 
-      // If this is the current session, update the currentSession signal
+      // Mirror the persisted state into the in-memory currentSession so
+      // downstream signal consumers (active prompt hydration, assistant_id
+      // checks, model preference) see the just-saved values immediately
+      // without waiting for the next session fetch.
       if (this.currentSession().sessionId === sessionId) {
         this.currentSession.update(current => ({ ...current, ...response }));
       }
@@ -623,8 +632,11 @@ export class SessionService {
     preferences: {
       lastModel?: string;
       enabledTools?: string[];
-      selectedPromptId?: string;
+      // Explicit `null` clears the selection; `undefined` (omitted) leaves it
+      // unchanged. The BFF mirrors this convention.
+      selectedPromptId?: string | null;
       customPromptText?: string;
+      agentType?: 'skill' | 'chat';
     }
   ): Promise<SessionMetadata> {
     return this.updateSessionMetadata(sessionId, preferences);
@@ -924,7 +936,9 @@ export class SessionService {
       if (currentSessionId && this.newSessionIds.has(currentSessionId)) {
         const cachedSession = cache.find(s => s.sessionId === currentSessionId);
         if (cachedSession && cachedSession.title !== this.currentSession().title) {
-          this.currentSession.set(cachedSession);
+          // Only sync the title — replacing the whole object would drop preferences
+          // (the list cache doesn't carry the full preferences sub-object)
+          this.currentSession.update(current => ({ ...current, title: cachedSession.title }));
         }
       }
     });

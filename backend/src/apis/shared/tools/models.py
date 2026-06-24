@@ -7,9 +7,9 @@ Integrates with the existing AppRole RBAC system.
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Set
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class ToolCategory(str, Enum):
@@ -63,6 +63,52 @@ class A2AAuthType(str, Enum):
     AWS_IAM = "aws-iam"
     AGENTCORE = "agentcore"  # AgentCore Runtime auth
     API_KEY = "api-key"
+
+
+class GatewayListingMode(str, Enum):
+    """How an AgentCore Gateway target lists its tools.
+
+    Maps to the `bedrock-agentcore-control` `listingMode` enum (uppercased at
+    the AWS boundary by GatewayTargetService). DYNAMIC resolves tools at call
+    time but disables 3LO/OAuth and Gateway semantic search; DEFAULT lists
+    tools statically and is required for both.
+    """
+
+    DEFAULT = "default"
+    DYNAMIC = "dynamic"
+
+
+class GatewayCredentialType(str, Enum):
+    """How the Gateway authenticates outbound to a target's MCP endpoint.
+
+    Maps to the `bedrock-agentcore-control` `credentialProviderType` enum.
+    NONE registers a public endpoint with no outbound credentials (the API's
+    `credentialProviderConfigurations` is omitted). GATEWAY_IAM_ROLE signs with
+    the gateway's own execution role (SigV4) — for an mcpServer target this
+    requires an explicit `iamCredentialProvider` naming the AWS service to sign
+    for (see `aws_service`). OAUTH and API_KEY reference an existing AgentCore
+    credential provider by ARN (provider provisioning is out of scope in v1).
+    """
+
+    NONE = "none"
+    GATEWAY_IAM_ROLE = "gateway_iam_role"
+    OAUTH = "oauth"
+    API_KEY = "api_key"
+
+
+class GatewayOAuthGrantType(str, Enum):
+    """OAuth grant the Gateway uses when calling an OAUTH-credentialed target.
+
+    Maps to the `bedrock-agentcore-control` `oauthCredentialProvider.grantType`
+    enum. AUTHORIZATION_CODE is the on-behalf-of-user (3LO) flow that reuses our
+    existing AgentCore Identity consent path (USER_FEDERATION); CLIENT_CREDENTIALS
+    is machine-to-machine (2LO, no user consent). Only meaningful when
+    credential_type is OAUTH.
+    """
+
+    AUTHORIZATION_CODE = "authorization_code"
+    CLIENT_CREDENTIALS = "client_credentials"
+    TOKEN_EXCHANGE = "token_exchange"
 
 
 class ToolStatus(str, Enum):
@@ -206,6 +252,189 @@ class MCPServerConfig(BaseModel):
             tools=_parse_mcp_tools(data.get("tools", [])),
             health_check_enabled=data.get("healthCheckEnabled", False),
             health_check_interval_seconds=data.get("healthCheckIntervalSeconds", 300),
+        )
+
+    def approval_required_names(self) -> set[str]:
+        """Return the names of tools flagged as requiring user approval."""
+        return {entry.name for entry in self.tools if entry.needs_approval}
+
+
+class MCPGatewayConfig(BaseModel):
+    """
+    Configuration for an externally deployed MCP server registered as a
+    target on the centralized AgentCore Gateway.
+
+    Used when protocol is 'mcp' (ToolProtocol.MCP_GATEWAY). Unlike
+    `MCPServerConfig` (protocol 'mcp_external', which the agent connects to
+    directly), the agent never talks to this endpoint — the Gateway fronts it,
+    and the tool reaches agents through the existing Gateway discovery path.
+
+    `target_id` and `gateway_arn` are AWS-assigned identifiers stamped onto the
+    config by the admin route after the Gateway target is created; they are the
+    catalog↔AWS link that lets update/delete reconcile the live target.
+    """
+
+    # Gateway target identity
+    target_name: str = Field(
+        ..., description="Gateway target name (unique within the gateway)"
+    )
+    endpoint_url: str = Field(
+        ..., description="External MCP server endpoint the Gateway calls"
+    )
+    listing_mode: GatewayListingMode = Field(
+        default=GatewayListingMode.DEFAULT,
+        description="How the Gateway lists this target's tools",
+    )
+
+    # Outbound auth from the Gateway to the target
+    credential_type: GatewayCredentialType = Field(
+        default=GatewayCredentialType.NONE,
+        description="How the Gateway authenticates to the target endpoint",
+    )
+    credential_provider_arn: Optional[str] = Field(
+        None,
+        description="ARN of an existing AgentCore credential provider "
+        "(required for OAUTH and API_KEY; unused for the others)",
+    )
+    aws_service: Optional[str] = Field(
+        None,
+        description="AWS service name for SigV4 signing (required for "
+        "GATEWAY_IAM_ROLE on an mcpServer target, e.g. 'lambda', 'execute-api', "
+        "'bedrock-agentcore'); unused for other credential types",
+    )
+    aws_region: Optional[str] = Field(
+        None,
+        description="AWS region for SigV4 signing (GATEWAY_IAM_ROLE only); "
+        "defaults to the gateway's region when omitted",
+    )
+    lambda_function_name: Optional[str] = Field(
+        None,
+        description="Name (or ARN) of the Lambda backing the endpoint, for a "
+        "GATEWAY_IAM_ROLE target on a Lambda Function URL. Lets the platform "
+        "grant the gateway role InvokeFunctionUrl on exactly this function at "
+        "registration (lambda:AddPermission) instead of a standing wildcard. "
+        "Same-account only; cross-account targets must be public or use a "
+        "credential provider.",
+    )
+    oauth_scopes: List[str] = Field(
+        default_factory=list,
+        description="OAuth scopes requested for OAUTH credential type",
+    )
+    grant_type: GatewayOAuthGrantType = Field(
+        default=GatewayOAuthGrantType.AUTHORIZATION_CODE,
+        description="OAuth grant for OAUTH credential type (3LO vs 2LO); "
+        "ignored for other credential types",
+    )
+    custom_parameters: Optional[Dict[str, str]] = Field(
+        None,
+        description="Extra parameters forwarded to the OAuth provider. These are "
+        "part of the AgentCore token-vault key, so they must match between "
+        "target registration and token retrieval.",
+    )
+
+    # Per-tool flags (only applied when listing_mode is DEFAULT — DYNAMIC
+    # listing resolves tool names at call time, so flags can't be matched)
+    tools: List[MCPToolEntry] = Field(
+        default_factory=list,
+        description="Tools exposed by this target, with per-tool flags. "
+        "Empty means rely on Gateway listing with no per-tool flags applied.",
+    )
+
+    # AWS-assigned identifiers (stamped on after target creation)
+    target_id: Optional[str] = Field(
+        None, description="Gateway target ID assigned by AgentCore on create"
+    )
+    gateway_arn: Optional[str] = Field(
+        None, description="ARN of the gateway the target lives on"
+    )
+
+    model_config = {"use_enum_values": True}
+
+    @model_validator(mode="after")
+    def _validate_credentials(self) -> "MCPGatewayConfig":
+        """Enforce the credential/listing-mode co-gating rules.
+
+        OAuth (3LO) and Gateway semantic search require DEFAULT listing — see
+        the listing-mode co-gating gotcha in issue #419. GATEWAY_IAM_ROLE uses
+        the gateway's execution role and takes no provider ARN.
+        """
+        if self.credential_type == GatewayCredentialType.OAUTH:
+            if not self.credential_provider_arn:
+                raise ValueError(
+                    "credential_type 'oauth' requires credential_provider_arn"
+                )
+            if self.listing_mode != GatewayListingMode.DEFAULT:
+                raise ValueError(
+                    "OAuth (3LO) targets require listing_mode 'default'; "
+                    "'dynamic' disables 3LO and Gateway semantic search"
+                )
+        elif self.credential_type == GatewayCredentialType.API_KEY:
+            if not self.credential_provider_arn:
+                raise ValueError(
+                    "credential_type 'api_key' requires credential_provider_arn"
+                )
+        elif self.credential_type == GatewayCredentialType.GATEWAY_IAM_ROLE:
+            if self.credential_provider_arn:
+                raise ValueError(
+                    "credential_type 'gateway_iam_role' signs with the gateway "
+                    "execution role and must not set credential_provider_arn"
+                )
+            if not self.aws_service:
+                raise ValueError(
+                    "credential_type 'gateway_iam_role' requires aws_service "
+                    "(the AWS service name for SigV4 signing, e.g. 'lambda', "
+                    "'execute-api', 'bedrock-agentcore') — an mcpServer target's "
+                    "IAM credential provider must name the service to sign for"
+                )
+        return self
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for DynamoDB storage."""
+        return {
+            "targetName": self.target_name,
+            "endpointUrl": self.endpoint_url,
+            "listingMode": self.listing_mode
+            if isinstance(self.listing_mode, str)
+            else self.listing_mode.value,
+            "credentialType": self.credential_type
+            if isinstance(self.credential_type, str)
+            else self.credential_type.value,
+            "credentialProviderArn": self.credential_provider_arn,
+            "awsService": self.aws_service,
+            "awsRegion": self.aws_region,
+            "lambdaFunctionName": self.lambda_function_name,
+            "oauthScopes": list(self.oauth_scopes),
+            "grantType": self.grant_type
+            if isinstance(self.grant_type, str)
+            else self.grant_type.value,
+            "customParameters": self.custom_parameters,
+            "tools": [entry.to_dict() for entry in self.tools],
+            "targetId": self.target_id,
+            "gatewayArn": self.gateway_arn,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "MCPGatewayConfig":
+        """Create from dictionary."""
+        return cls(
+            target_name=data.get("targetName", ""),
+            endpoint_url=data.get("endpointUrl", ""),
+            listing_mode=data.get("listingMode", GatewayListingMode.DEFAULT),
+            credential_type=data.get(
+                "credentialType", GatewayCredentialType.NONE
+            ),
+            credential_provider_arn=data.get("credentialProviderArn"),
+            aws_service=data.get("awsService"),
+            aws_region=data.get("awsRegion"),
+            lambda_function_name=data.get("lambdaFunctionName"),
+            oauth_scopes=data.get("oauthScopes") or [],
+            grant_type=data.get(
+                "grantType", GatewayOAuthGrantType.AUTHORIZATION_CODE
+            ),
+            custom_parameters=data.get("customParameters"),
+            tools=_parse_mcp_tools(data.get("tools", [])),
+            target_id=data.get("targetId"),
+            gateway_arn=data.get("gatewayArn"),
         )
 
     def approval_required_names(self) -> set[str]:
@@ -428,6 +657,10 @@ class ToolDefinition(BaseModel):
         None,
         description="A2A agent configuration (required when protocol is 'a2a')",
     )
+    mcp_gateway_config: Optional[MCPGatewayConfig] = Field(
+        None,
+        description="Gateway target configuration (required when protocol is 'mcp')",
+    )
 
     # MCP Apps (SEP-1865) — derived live from the MCP server's `tools/list`
     # `_meta.ui`, not admin-configured, so these are intentionally NOT
@@ -455,6 +688,23 @@ class ToolDefinition(BaseModel):
     )
 
     model_config = {"use_enum_values": True}
+
+    def curated_tool_names(self) -> Optional[Set[str]]:
+        """The MCP tool names this catalog tool exposes, when known.
+
+        For an external-MCP (``mcp_external``) or Gateway (``mcp``) tool the
+        admin may curate the server's tool list; return those names so callers
+        can validate a per-tool selection (``tool_id::name``) against them.
+        Returns ``None`` when the tool is not an MCP server or has no curated
+        list (e.g. a DYNAMIC gateway target, or a server whose tools are
+        discovered live) — in which case per-tool names can't be validated
+        statically.
+        """
+        cfg = self.mcp_config or self.mcp_gateway_config
+        entries = getattr(cfg, "tools", None) if cfg else None
+        if not entries:
+            return None
+        return {entry.name for entry in entries}
 
     def to_dynamo_item(self) -> dict:
         """Convert to DynamoDB item format."""
@@ -484,6 +734,8 @@ class ToolDefinition(BaseModel):
             item["mcpConfig"] = self.mcp_config.to_dict()
         if self.a2a_config:
             item["a2aConfig"] = self.a2a_config.to_dict()
+        if self.mcp_gateway_config:
+            item["mcpGatewayConfig"] = self.mcp_gateway_config.to_dict()
 
         return item
 
@@ -501,6 +753,10 @@ class ToolDefinition(BaseModel):
         a2a_config = None
         if item.get("a2aConfig"):
             a2a_config = A2AAgentConfig.from_dict(item["a2aConfig"])
+
+        mcp_gateway_config = None
+        if item.get("mcpGatewayConfig"):
+            mcp_gateway_config = MCPGatewayConfig.from_dict(item["mcpGatewayConfig"])
 
         # Handle legacy protocol values gracefully
         protocol_value = item.get("protocol", ToolProtocol.LOCAL)
@@ -532,6 +788,7 @@ class ToolDefinition(BaseModel):
             enabled_by_default=item.get("enabledByDefault", False),
             mcp_config=mcp_config,
             a2a_config=a2a_config,
+            mcp_gateway_config=mcp_gateway_config,
             created_at=datetime.fromisoformat(created_at.rstrip("Z")) if created_at else datetime.now(timezone.utc),
             updated_at=datetime.fromisoformat(updated_at.rstrip("Z")) if updated_at else datetime.now(timezone.utc),
             created_by=item.get("createdBy"),
@@ -578,6 +835,24 @@ class UserToolPreference(BaseModel):
 # =============================================================================
 
 
+class UserToolServerTool(BaseModel):
+    """One tool exposed by an MCP-server catalog tool.
+
+    Surfaced on ``UserToolAccess`` so the user-facing tools UI can enable a
+    subset of a server's tools (per-tool enablement). ``name`` is the raw MCP
+    tool name; a preference for it is keyed ``<tool_id>::<name>``. ``enabled``
+    is the user's effective state for this individual tool (scoped preference,
+    falling back to the server-level preference, then the catalog default).
+    """
+
+    name: str
+    description: Optional[str] = None
+    needs_approval: bool = Field(default=False, alias="needsApproval")
+    enabled: bool = True
+
+    model_config = {"populate_by_name": True}
+
+
 class UserToolAccess(BaseModel):
     """
     Computed tool access for a specific user.
@@ -591,6 +866,13 @@ class UserToolAccess(BaseModel):
     protocol: ToolProtocol
     status: ToolStatus
     requires_oauth_provider: Optional[str] = Field(None, alias="requiresOauthProvider")
+
+    # For MCP-server tools (protocol 'mcp'/'mcp_external'): the individual tools
+    # the server exposes, so the UI can offer per-tool enablement. Empty for
+    # non-MCP tools or servers whose tools are discovered live.
+    server_tools: List[UserToolServerTool] = Field(
+        default_factory=list, alias="serverTools"
+    )
 
     # Access info
     granted_by: List[str] = Field(
@@ -697,6 +979,57 @@ class MCPServerConfigRequest(BaseModel):
         )
 
 
+class MCPGatewayConfigRequest(BaseModel):
+    """Request body for Gateway target configuration (protocol 'mcp').
+
+    Does not accept `targetId`/`gatewayArn` — those are AWS-assigned and
+    stamped onto the stored config by the admin route after the Gateway
+    target is created.
+    """
+
+    target_name: str = Field(..., alias="targetName")
+    endpoint_url: str = Field(..., alias="endpointUrl")
+    listing_mode: GatewayListingMode = Field(
+        default=GatewayListingMode.DEFAULT, alias="listingMode"
+    )
+    credential_type: GatewayCredentialType = Field(
+        default=GatewayCredentialType.NONE, alias="credentialType"
+    )
+    credential_provider_arn: Optional[str] = Field(
+        None, alias="credentialProviderArn"
+    )
+    aws_service: Optional[str] = Field(None, alias="awsService")
+    aws_region: Optional[str] = Field(None, alias="awsRegion")
+    lambda_function_name: Optional[str] = Field(None, alias="lambdaFunctionName")
+    oauth_scopes: List[str] = Field(default_factory=list, alias="oauthScopes")
+    grant_type: GatewayOAuthGrantType = Field(
+        default=GatewayOAuthGrantType.AUTHORIZATION_CODE, alias="grantType"
+    )
+    custom_parameters: Optional[Dict[str, str]] = Field(
+        None, alias="customParameters"
+    )
+    tools: List[MCPToolEntryPayload] = Field(default_factory=list)
+
+    model_config = {"populate_by_name": True, "use_enum_values": True}
+
+    def to_model(self) -> MCPGatewayConfig:
+        """Convert to MCPGatewayConfig model (runs the co-gating validator)."""
+        return MCPGatewayConfig(
+            target_name=self.target_name,
+            endpoint_url=self.endpoint_url,
+            listing_mode=self.listing_mode,
+            credential_type=self.credential_type,
+            credential_provider_arn=self.credential_provider_arn,
+            aws_service=self.aws_service,
+            aws_region=self.aws_region,
+            lambda_function_name=self.lambda_function_name,
+            oauth_scopes=self.oauth_scopes,
+            grant_type=self.grant_type,
+            custom_parameters=self.custom_parameters,
+            tools=[entry.to_model() for entry in self.tools],
+        )
+
+
 class A2AAgentConfigRequest(BaseModel):
     """Request body for A2A agent configuration."""
 
@@ -746,6 +1079,9 @@ class ToolCreateRequest(BaseModel):
     # External tool configurations (optional based on protocol)
     mcp_config: Optional[MCPServerConfigRequest] = Field(None, alias="mcpConfig")
     a2a_config: Optional[A2AAgentConfigRequest] = Field(None, alias="a2aConfig")
+    mcp_gateway_config: Optional[MCPGatewayConfigRequest] = Field(
+        None, alias="mcpGatewayConfig"
+    )
 
     model_config = {"populate_by_name": True}
 
@@ -768,6 +1104,9 @@ class ToolUpdateRequest(BaseModel):
     # External tool configurations (optional based on protocol)
     mcp_config: Optional[MCPServerConfigRequest] = Field(None, alias="mcpConfig")
     a2a_config: Optional[A2AAgentConfigRequest] = Field(None, alias="a2aConfig")
+    mcp_gateway_config: Optional[MCPGatewayConfigRequest] = Field(
+        None, alias="mcpGatewayConfig"
+    )
 
     model_config = {"populate_by_name": True}
 
@@ -848,6 +1187,61 @@ class MCPServerConfigResponse(BaseModel):
         )
 
 
+class MCPGatewayConfigResponse(BaseModel):
+    """Response model for Gateway target configuration (protocol 'mcp').
+
+    Includes the AWS-assigned `targetId`/`gatewayArn` so the admin UI can show
+    the catalog↔Gateway linkage.
+    """
+
+    target_name: str = Field(..., alias="targetName")
+    endpoint_url: str = Field(..., alias="endpointUrl")
+    listing_mode: str = Field(..., alias="listingMode")
+    credential_type: str = Field(..., alias="credentialType")
+    credential_provider_arn: Optional[str] = Field(
+        None, alias="credentialProviderArn"
+    )
+    aws_service: Optional[str] = Field(None, alias="awsService")
+    aws_region: Optional[str] = Field(None, alias="awsRegion")
+    lambda_function_name: Optional[str] = Field(None, alias="lambdaFunctionName")
+    oauth_scopes: List[str] = Field(default_factory=list, alias="oauthScopes")
+    grant_type: str = Field(..., alias="grantType")
+    custom_parameters: Optional[Dict[str, str]] = Field(
+        None, alias="customParameters"
+    )
+    tools: List[MCPToolEntryPayload] = Field(default_factory=list)
+    target_id: Optional[str] = Field(None, alias="targetId")
+    gateway_arn: Optional[str] = Field(None, alias="gatewayArn")
+
+    model_config = {"populate_by_name": True}
+
+    @classmethod
+    def from_model(cls, config: MCPGatewayConfig) -> "MCPGatewayConfigResponse":
+        """Create response from MCPGatewayConfig model."""
+        return cls(
+            target_name=config.target_name,
+            endpoint_url=config.endpoint_url,
+            listing_mode=config.listing_mode
+            if isinstance(config.listing_mode, str)
+            else config.listing_mode.value,
+            credential_type=config.credential_type
+            if isinstance(config.credential_type, str)
+            else config.credential_type.value,
+            credential_provider_arn=config.credential_provider_arn,
+            aws_service=config.aws_service,
+            aws_region=config.aws_region,
+            lambda_function_name=config.lambda_function_name,
+            oauth_scopes=list(config.oauth_scopes),
+            grant_type=config.grant_type
+            if isinstance(config.grant_type, str)
+            else config.grant_type.value,
+            custom_parameters=config.custom_parameters,
+            tools=[MCPToolEntryPayload.from_model(entry) for entry in config.tools],
+            target_id=config.target_id,
+            gateway_arn=config.gateway_arn,
+        )
+
+
 class A2AAgentConfigResponse(BaseModel):
     """Response model for A2A agent configuration."""
 
@@ -901,6 +1295,9 @@ class AdminToolResponse(BaseModel):
     # External tool configurations
     mcp_config: Optional[MCPServerConfigResponse] = Field(None, alias="mcpConfig")
     a2a_config: Optional[A2AAgentConfigResponse] = Field(None, alias="a2aConfig")
+    mcp_gateway_config: Optional[MCPGatewayConfigResponse] = Field(
+        None, alias="mcpGatewayConfig"
+    )
 
     model_config = {"populate_by_name": True, "use_enum_values": True}
 
@@ -917,6 +1314,12 @@ class AdminToolResponse(BaseModel):
         a2a_config_response = None
         if tool.a2a_config:
             a2a_config_response = A2AAgentConfigResponse.from_model(tool.a2a_config)
+
+        mcp_gateway_config_response = None
+        if tool.mcp_gateway_config:
+            mcp_gateway_config_response = MCPGatewayConfigResponse.from_model(
+                tool.mcp_gateway_config
+            )
 
         return cls(
             tool_id=tool.tool_id,
@@ -936,6 +1339,7 @@ class AdminToolResponse(BaseModel):
             updated_by=tool.updated_by,
             mcp_config=mcp_config_response,
             a2a_config=a2a_config_response,
+            mcp_gateway_config=mcp_gateway_config_response,
         )
 
 
@@ -950,9 +1354,17 @@ class MCPDiscoverRequest(BaseModel):
     """Request body for POST /api/admin/tools/discover.
 
     Same fields as MCPServerConfigRequest minus the `tools` list — the
-    point of discovery is to populate that list. OAuth-gated and OIDC-
-    forwarded servers can't be discovered admin-side (no end-user token
-    available); the route returns a 400 in those cases."""
+    point of discovery is to populate that list. Provider-gated OAuth (3LO)
+    servers can't be discovered admin-side (no end-user provider token
+    available); the route returns a 400 in that case.
+
+    `forward_auth_token` mirrors the catalog flag of the same name: when set,
+    the route signs the discovery request with the *admin's own* OIDC token
+    instead of SigV4, matching how the agent loop forwards the end-user's
+    token at runtime. This lets a same-team MCP server that validates a
+    forwarded JWT (Lambda Function URL AuthType=NONE) be discovered without
+    any IAM invoke permission.
+    """
 
     server_url: str = Field(..., alias="serverUrl")
     transport: MCPTransport = Field(default=MCPTransport.STREAMABLE_HTTP)
@@ -960,6 +1372,7 @@ class MCPDiscoverRequest(BaseModel):
     aws_region: Optional[str] = Field(None, alias="awsRegion")
     api_key_header: Optional[str] = Field(None, alias="apiKeyHeader")
     secret_arn: Optional[str] = Field(None, alias="secretArn")
+    forward_auth_token: bool = Field(default=False, alias="forwardAuthToken")
 
     model_config = {"populate_by_name": True, "use_enum_values": True}
 
@@ -986,5 +1399,25 @@ class MCPDiscoverResponse(BaseModel):
     """Response body for POST /api/admin/tools/discover."""
 
     tools: List[DiscoveredMCPTool]
+
+
+class GatewayTargetStatusResponse(BaseModel):
+    """Live health of the Gateway target backing a protocol='mcp' tool.
+
+    Response body for GET /api/admin/tools/{tool_id}/gateway-status. The
+    AgentCore Gateway connects to and lists tools from the target
+    asynchronously after registration, so the catalog row alone can't tell an
+    admin whether the target is usable. `status` is the gateway target status
+    (CREATING / READY / FAILED / UPDATE_UNSUCCESSFUL / …); `status_reasons`
+    carries the gateway's explanation when unhealthy. `MISSING` is a synthetic
+    status used when the catalog references a target that no longer exists on
+    the gateway. `healthy` is a convenience the badge can render directly."""
+
+    target_id: str = Field(..., alias="targetId")
+    status: str
+    status_reasons: List[str] = Field(default_factory=list, alias="statusReasons")
+    healthy: bool
+
+    model_config = {"populate_by_name": True}
 
 

@@ -3,7 +3,7 @@
 Provides endpoints for managing session metadata.
 """
 
-from fastapi import APIRouter, HTTPException, Depends, Query, Response, BackgroundTasks
+from fastapi import APIRouter, HTTPException, Depends, Query, Response, BackgroundTasks, status
 from typing import Optional
 import logging
 from datetime import datetime, timezone
@@ -23,12 +23,14 @@ from apis.shared.sessions.metadata import (
     list_user_sessions,
     get_session_metadata,
     remove_pending_interrupts,
+    session_exists_for_other_user,
     store_session_metadata,
 )
 from .services.session_service import SessionService
 from apis.app_api.shares.service import get_share_service
 from apis.shared.auth.dependencies import get_current_user_from_session
 from apis.shared.auth.models import User
+from apis.shared.system_prompts.service import get_system_prompts_service
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +178,25 @@ async def update_session_metadata_endpoint(
     """
     user_id = current_user.user_id
 
+    # Detect whether the client explicitly included `selectedPromptId` in the
+    # payload (vs. omitting it). Pydantic's `model_fields_set` records every
+    # alias that was present in the input, regardless of value. This lets us
+    # distinguish a real "clear to null" from "leave unchanged".
+    fields_set = request.model_fields_set
+    selected_prompt_provided = "selected_prompt_id" in fields_set
+    clearing_prompt = selected_prompt_provided and request.selected_prompt_id is None
+
+    # Validate selected_prompt_id references an enabled prompt — reject early
+    # so we never persist a stale/invalid prompt reference.
+    if request.selected_prompt_id:
+        service = get_system_prompts_service()
+        prompt = await service.get_enabled_prompt(request.selected_prompt_id)
+        if not prompt:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"System prompt '{request.selected_prompt_id}' not found or not enabled",
+            )
+
     logger.info("PUT /sessions/metadata - updating session metadata")
 
     try:
@@ -186,6 +207,24 @@ async def update_session_metadata_endpoint(
         )
 
         if not existing_metadata:
+            # The per-user fetch can return None either because the session
+            # is genuinely fresh OR because a row exists for this
+            # session_id under a different user's partition (the
+            # SessionLookupIndex GSI is shared across users). Mirror GET's
+            # 404 in the second case so the caller cannot use a write to
+            # claim ownership of a session id that's already taken.
+            if await session_exists_for_other_user(
+                session_id=session_id, current_user_id=user_id
+            ):
+                logger.warning(
+                    "PUT /sessions/%s/metadata: session id is taken under a different user; refusing",
+                    session_id,
+                )
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Session not found: {session_id}",
+                )
+
             # Create new session metadata with defaults
             now = datetime.now(timezone.utc).isoformat() + "Z"
 
@@ -196,14 +235,16 @@ async def update_session_metadata_endpoint(
                 request.enabled_tools,
                 request.selected_prompt_id,
                 request.custom_prompt_text,
-                request.assistant_id
+                request.assistant_id,
+                request.agent_type
             ]):
                 preferences = SessionPreferences(
                     last_model=request.last_model,
                     enabled_tools=request.enabled_tools,
                     selected_prompt_id=request.selected_prompt_id,
                     custom_prompt_text=request.custom_prompt_text,
-                    assistant_id=request.assistant_id
+                    assistant_id=request.assistant_id,
+                    agent_type=request.agent_type
                 )
 
             # IMPORTANT: Do NOT set message_count here - it should only be managed by
@@ -232,8 +273,10 @@ async def update_session_metadata_endpoint(
                 request.last_model,
                 request.enabled_tools,
                 request.selected_prompt_id,
+                clearing_prompt,
                 request.custom_prompt_text,
-                request.assistant_id
+                request.assistant_id,
+                request.agent_type
             ]):
                 # Merge with existing preferences
                 existing_prefs = preferences.model_dump(by_alias=False) if preferences else {}
@@ -242,12 +285,16 @@ async def update_session_metadata_endpoint(
                     new_prefs['last_model'] = request.last_model
                 if request.enabled_tools:
                     new_prefs['enabled_tools'] = request.enabled_tools
-                if request.selected_prompt_id:
+                if clearing_prompt:
+                    new_prefs['selected_prompt_id'] = None
+                elif request.selected_prompt_id:
                     new_prefs['selected_prompt_id'] = request.selected_prompt_id
                 if request.custom_prompt_text:
                     new_prefs['custom_prompt_text'] = request.custom_prompt_text
                 if request.assistant_id:
                     new_prefs['assistant_id'] = request.assistant_id
+                if request.agent_type:
+                    new_prefs['agent_type'] = request.agent_type
 
                 merged_prefs = {**existing_prefs, **new_prefs}
                 preferences = SessionPreferences(**merged_prefs)

@@ -45,7 +45,7 @@ class TestCreateAgentBedrock:
     """Validates: Requirement 4.1"""
 
     @patch("agents.main_agent.core.agent_factory.Agent")
-    @patch("agents.main_agent.core.agent_factory.BedrockModel")
+    @patch("agents.main_agent.core.agent_factory.CountTokensBedrockModel")
     def test_bedrock_provider_creates_bedrock_model(self, mock_bedrock_cls, mock_agent_cls):
         from agents.main_agent.core.agent_factory import AgentFactory
 
@@ -82,6 +82,88 @@ class TestCreateAgentOpenAI:
         assert call_kwargs["client_args"]["api_key"] == "sk-test-key"
         mock_agent_cls.assert_called_once()
         assert mock_agent_cls.call_args.kwargs["model"] is mock_openai_instance
+
+
+# ---------------------------------------------------------------------------
+# Bedrock Mantle provider creates Agent with OpenAIModel against the
+# regional Mantle endpoint, authenticated with a minted bearer token.
+# ---------------------------------------------------------------------------
+class TestCreateAgentMantle:
+    @patch("agents.main_agent.core.agent_factory.Agent")
+    @patch("agents.main_agent.core.agent_factory.OpenAIModel")
+    def test_mantle_provider_creates_openai_model_with_mantle_client(
+        self, mock_openai_cls, mock_agent_cls, monkeypatch
+    ):
+        from agents.main_agent.core.agent_factory import AgentFactory
+
+        monkeypatch.setenv("AWS_REGION", "us-west-2")
+        mock_model_instance = MagicMock()
+        mock_openai_cls.return_value = mock_model_instance
+
+        mantle_config = ModelConfig(
+            model_id="openai.gpt-oss-120b", provider=ModelProvider.MANTLE
+        )
+        with patch(
+            "apis.shared.bedrock.generate_bedrock_bearer_token",
+            return_value="bedrock-api-key-token",
+        ) as mock_token:
+            AgentFactory.create_agent(model_config=mantle_config, **_COMMON_KWARGS)
+
+        mock_token.assert_called_once_with("us-west-2")
+        mock_openai_cls.assert_called_once()
+        call_kwargs = mock_openai_cls.call_args.kwargs
+        assert call_kwargs["client_args"]["api_key"] == "bedrock-api-key-token"
+        assert (
+            call_kwargs["client_args"]["base_url"]
+            == "https://bedrock-mantle.us-west-2.api.aws/v1"
+        )
+        assert call_kwargs["model_id"] == "openai.gpt-oss-120b"
+        mock_agent_cls.assert_called_once()
+        assert mock_agent_cls.call_args.kwargs["model"] is mock_model_instance
+
+    @patch("agents.main_agent.core.agent_factory.Agent")
+    @patch("agents.main_agent.core.agent_factory.OpenAIModel")
+    def test_mantle_endpoint_path_selects_base_url(
+        self, mock_openai_cls, mock_agent_cls, monkeypatch
+    ):
+        """A model carrying mantle_endpoint_path='/openai/v1' (e.g. Gemma 4)
+        must build the base URL on that path, not the default /v1."""
+        from agents.main_agent.core.agent_factory import AgentFactory
+
+        monkeypatch.setenv("AWS_REGION", "us-west-2")
+        mantle_config = ModelConfig(
+            model_id="google.gemma-4-31b",
+            provider=ModelProvider.MANTLE,
+            mantle_endpoint_path="/openai/v1",
+        )
+        with patch(
+            "apis.shared.bedrock.generate_bedrock_bearer_token",
+            return_value="bedrock-api-key-token",
+        ):
+            AgentFactory.create_agent(model_config=mantle_config, **_COMMON_KWARGS)
+
+        call_kwargs = mock_openai_cls.call_args.kwargs
+        assert (
+            call_kwargs["client_args"]["base_url"]
+            == "https://bedrock-mantle.us-west-2.api.aws/openai/v1"
+        )
+
+    @patch("agents.main_agent.core.agent_factory.Agent")
+    @patch("agents.main_agent.core.agent_factory.OpenAIModel")
+    def test_mantle_without_credentials_raises(
+        self, mock_openai_cls, mock_agent_cls, monkeypatch
+    ):
+        from agents.main_agent.core.agent_factory import AgentFactory
+
+        mantle_config = ModelConfig(
+            model_id="openai.gpt-oss-120b", provider=ModelProvider.MANTLE
+        )
+        with patch(
+            "apis.shared.bedrock.generate_bedrock_bearer_token",
+            side_effect=ValueError("No AWS credentials available"),
+        ):
+            with pytest.raises(ValueError, match="No AWS credentials"):
+                AgentFactory.create_agent(model_config=mantle_config, **_COMMON_KWARGS)
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +227,7 @@ class TestRetryStrategy:
     """Validates: Requirements 4.6, 4.7"""
 
     @patch("agents.main_agent.core.agent_factory.Agent")
-    @patch("agents.main_agent.core.agent_factory.BedrockModel")
+    @patch("agents.main_agent.core.agent_factory.CountTokensBedrockModel")
     def test_bedrock_with_retry_config_passes_retry_strategy(
         self, mock_bedrock_cls, mock_agent_cls
     ):
@@ -166,7 +248,7 @@ class TestRetryStrategy:
         assert agent_kwargs["retry_strategy"] is not None
 
     @patch("agents.main_agent.core.agent_factory.Agent")
-    @patch("agents.main_agent.core.agent_factory.BedrockModel")
+    @patch("agents.main_agent.core.agent_factory.CountTokensBedrockModel")
     def test_bedrock_without_retry_config_passes_none(self, mock_bedrock_cls, mock_agent_cls):
         """Req 4.7 — no retry_config → retry_strategy is None."""
         from agents.main_agent.core.agent_factory import AgentFactory
@@ -229,7 +311,7 @@ class TestSequentialToolExecutor:
     """Validates: Requirement 4.8"""
 
     @patch("agents.main_agent.core.agent_factory.Agent")
-    @patch("agents.main_agent.core.agent_factory.BedrockModel")
+    @patch("agents.main_agent.core.agent_factory.CountTokensBedrockModel")
     def test_sequential_tool_executor_passed(self, mock_bedrock_cls, mock_agent_cls):
         from agents.main_agent.core.agent_factory import AgentFactory
         from strands.tools.executors import SequentialToolExecutor

@@ -26,6 +26,7 @@ import type {
   CompactionEvent,
   ArtifactEvent,
   UiResourceEvent,
+  ToolInputPartialEvent,
 } from '../../../shared/utils/stream-parser';
 import {
   processStreamEvent,
@@ -372,6 +373,15 @@ export class StreamParserService {
         this.mcpAppState.recordLive(data);
       },
 
+      onToolInputPartial: (data: ToolInputPartialEvent) => {
+        // Streamed partial tool input (SEP-1865). Arrives repeatedly while a
+        // UI tool's args are still streaming (after early frame mount). Record
+        // the latest healed prefix keyed by toolUseId; the frame relays it to
+        // the App as `ui/notifications/tool-input-partial` for progressive
+        // rendering (e.g. Excalidraw's guided camera tour).
+        this.mcpAppState.recordPartialInput(data.toolUseId, data.arguments);
+      },
+
       onToolApprovalRequired: (data: ToolApprovalRequiredEvent) => {
         const messages = this.allMessages();
         let lastAssistantId: string | undefined;
@@ -450,7 +460,7 @@ export class StreamParserService {
       id: computedId,
       role: data.role,
       contentBlocks: new Map(),
-      created_at: new Date().toISOString(),
+      createdAt: new Date().toISOString(),
       isComplete: false,
     };
 
@@ -881,13 +891,17 @@ export class StreamParserService {
       cacheWriteInputTokens?: number;
     } | undefined;
 
+    const existingBreakdown = existingMetadata['contextBreakdown'];
+    const newBreakdown = newMetadata['contextBreakdown'];
+
     const needsUpdate =
       (!existingTTFT && newTTFT) ||
       (existingCost === undefined && newCost !== undefined) ||
       (existingTokenUsage?.cacheReadInputTokens === undefined &&
         newTokenUsage?.cacheReadInputTokens !== undefined) ||
       (existingTokenUsage?.cacheWriteInputTokens === undefined &&
-        newTokenUsage?.cacheWriteInputTokens !== undefined);
+        newTokenUsage?.cacheWriteInputTokens !== undefined) ||
+      (existingBreakdown === undefined && newBreakdown !== undefined);
 
     if (needsUpdate) {
       this.completedMessages.update((messages) => {
@@ -924,7 +938,7 @@ export class StreamParserService {
       id: builder.id,
       role: builder.role,
       content: sortedBlocks,
-      created_at: builder.created_at,
+      createdAt: builder.createdAt,
       metadata: this.getMetadataForMessage(),
     };
 
@@ -972,6 +986,10 @@ export class StreamParserService {
 
     if (metadataEvent.cost !== undefined) {
       result['cost'] = metadataEvent.cost;
+    }
+
+    if (metadataEvent.contextBreakdown !== undefined) {
+      result['contextBreakdown'] = metadataEvent.contextBreakdown;
     }
 
     if (metadataEvent.trace !== undefined) {

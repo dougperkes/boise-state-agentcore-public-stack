@@ -15,7 +15,7 @@ OAuth Support:
 
 import logging
 import re
-from typing import Any, Callable, Optional, List
+from typing import Any, Callable, Optional, List, Set
 
 from mcp.client.streamable_http import streamablehttp_client
 from strands.tools.mcp import MCPClient
@@ -26,6 +26,7 @@ from apis.shared.tools.models import (
     MCPTransport,
     ToolDefinition,
 )
+from apis.shared.tools.scoped_ids import base_tool_id, collect_tool_name_filters
 from agents.main_agent.integrations import oauth_token_cache
 from agents.main_agent.integrations.mcp_apps import UICapableMCPClient
 from agents.main_agent.integrations.gateway_auth import get_sigv4_auth
@@ -65,7 +66,7 @@ def extract_region_from_url(url: str) -> Optional[str]:
     return None
 
 
-def detect_aws_service_from_url(url: str) -> str:
+def detect_aws_service_from_url(url: str) -> Optional[str]:
     """
     Detect the AWS service name for SigV4 signing based on URL pattern.
 
@@ -74,11 +75,18 @@ def detect_aws_service_from_url(url: str) -> str:
     - API Gateway: "execute-api"
     - AgentCore Gateway: "bedrock-agentcore"
 
+    Returns ``None`` for any URL that doesn't match a recognized AWS service
+    hostname pattern. Callers that wire SigV4 auth must treat ``None`` as a
+    refusal — issuing a SigV4-signed request to a non-AWS host would attach
+    the task's temporary IAM credentials to a request that the destination
+    has no business seeing.
+
     Args:
         url: The server URL
 
     Returns:
-        AWS service name for SigV4 signing
+        AWS service name for SigV4 signing, or None if the URL doesn't match
+        a known AWS service.
     """
     if ".lambda-url." in url and ".on.aws" in url:
         return "lambda"
@@ -87,9 +95,11 @@ def detect_aws_service_from_url(url: str) -> str:
     elif ".bedrock-agentcore." in url and ".amazonaws.com" in url:
         return "bedrock-agentcore"
     else:
-        # Default to lambda for unknown patterns (most common for MCP servers)
-        logger.warning(f"Could not detect AWS service from URL, defaulting to 'lambda': {url}")
-        return "lambda"
+        logger.debug(
+            "URL is not a recognized AWS service endpoint; SigV4 signing not applicable: %s",
+            url,
+        )
+        return None
 
 
 def create_external_mcp_client(
@@ -97,6 +107,7 @@ def create_external_mcp_client(
     tool_definition: Optional[ToolDefinition] = None,
     oauth_token: Optional[str] = None,
     token_provider: Optional[Callable[[], Optional[str]]] = None,
+    allowed_tool_names: Optional[Set[str]] = None,
 ) -> Optional[MCPClient]:
     """
     Create an MCP client for an externally deployed MCP server.
@@ -109,6 +120,10 @@ def create_external_mcp_client(
         tool_definition: Optional tool definition for logging
         oauth_token: Optional static token (used for OIDC forwarding)
         token_provider: Optional callable returning the current token
+        allowed_tool_names: If provided, only these MCP-server tool names are
+            exposed to the model (per-tool enablement). ``None`` exposes the
+            whole server. Matched against the raw MCP tool name by the SDK's
+            ``ToolFilters`` (no prefix is applied to external clients).
 
     Returns:
         MCPClient instance or None if configuration is invalid
@@ -145,15 +160,25 @@ def create_external_mcp_client(
 
         # AWS IAM SigV4 authentication (for Lambda/API Gateway without OAuth)
         elif config.auth_type == MCPAuthType.AWS_IAM or config.auth_type == "aws-iam":
+            # Detect the correct AWS service name for SigV4 signing. The
+            # detector returns None for any host that isn't a recognized
+            # AWS service endpoint — refuse to construct the client in
+            # that case rather than ship the task's IAM credentials to
+            # an arbitrary destination.
+            service = detect_aws_service_from_url(config.server_url)
+            if service is None:
+                logger.warning(
+                    "MCP client construction refused: auth_type=aws-iam against non-AWS URL %s",
+                    config.server_url,
+                )
+                return None
+
             region = config.aws_region
             if not region:
                 region = extract_region_from_url(config.server_url)
             if not region:
                 region = "us-west-2"  # Default fallback
                 logger.warning(f"Could not extract region from URL, using default: {region}")
-
-            # Detect the correct AWS service name for SigV4 signing
-            service = detect_aws_service_from_url(config.server_url)
 
             sigv4_auth = get_sigv4_auth(service=service, region=region)
             auth_handlers.append(sigv4_auth)
@@ -183,6 +208,15 @@ def create_external_mcp_client(
             transport = MCPTransport(transport)
 
         if transport == MCPTransport.STREAMABLE_HTTP:
+            # Per-tool enablement: restrict the model's view of this server to
+            # the selected tools. The base MCPClient applies this in
+            # list_tools_sync (matched against the raw MCP tool name); the UI
+            # filter then layers on top. Sorted for a stable client identity.
+            tool_filters = (
+                {"allowed": sorted(allowed_tool_names)}
+                if allowed_tool_names is not None
+                else None
+            )
             # UICapableMCPClient advertises the MCP Apps UI extension on
             # initialize and filters app-only tools out of the model's tool
             # list (both inert unless AGENTCORE_MCP_APPS_HOST_ENABLED=true).
@@ -190,9 +224,20 @@ def create_external_mcp_client(
                 lambda url=config.server_url, auth=auth: streamablehttp_client(
                     url,
                     auth=auth
-                )
+                ),
+                tool_filters=tool_filters,
+                # Retained so the MCP Apps header can resolve the server's
+                # served-manifest icon from this origin (best-effort).
+                server_url=config.server_url,
             )
-            logger.info(f"✅ External MCP client created for {tool_id}: {config.server_url}")
+            scope_label = (
+                f" (tools: {', '.join(sorted(allowed_tool_names))})"
+                if allowed_tool_names is not None
+                else ""
+            )
+            logger.info(
+                f"✅ External MCP client created for {tool_id}: {config.server_url}{scope_label}"
+            )
             return mcp_client
         else:
             logger.warning(f"Unsupported transport type: {transport}")
@@ -279,7 +324,12 @@ class ExternalMCPIntegration:
         clients = []
         repository = get_tool_catalog_repository()
 
-        for tool_id in enabled_tool_ids:
+        # Scoped ids (`base::tool`) collapse to their base catalog id plus a
+        # per-server set of selected tool names; a bare id means the whole
+        # server (filter is None).
+        name_filters = collect_tool_name_filters(enabled_tool_ids)
+
+        for tool_id, allowed_tool_names in name_filters.items():
             try:
                 tool = await repository.get_tool(tool_id)
                 if not tool:
@@ -297,6 +347,11 @@ class ExternalMCPIntegration:
                 requires_user_auth = forward_auth or requires_oauth
 
                 cache_key = self._get_cache_key(tool_id, user_id, requires_user_auth)
+                # A different selected-tool subset is a different client, so fold
+                # the filter into the cache key (the integration is shared across
+                # agents — two users may select different subsets of one server).
+                if allowed_tool_names is not None:
+                    cache_key += "|allow:" + ",".join(sorted(allowed_tool_names))
                 tool_version = (
                     tool.updated_at.isoformat() + "Z" if tool.updated_at else ""
                 )
@@ -350,6 +405,7 @@ class ExternalMCPIntegration:
                     tool_definition=tool,
                     oauth_token=static_token,
                     token_provider=token_provider,
+                    allowed_tool_names=allowed_tool_names,
                 )
 
                 if client:
@@ -390,11 +446,36 @@ class ExternalMCPIntegration:
         return clients
 
     def get_client(self, tool_id: str, user_id: Optional[str] = None) -> Optional[MCPClient]:
-        if user_id:
-            user_key = f"{user_id}:{tool_id}"
-            if user_key in self.clients:
-                return self.clients[user_key]
-        return self.clients.get(tool_id)
+        """Return the live client for a (possibly-scoped) catalog tool id.
+
+        Clients are cached under the *base* catalog id — optionally
+        ``"{user_id}:"``-prefixed (user-auth tools) and optionally
+        ``"|allow:<names>"``-suffixed when only a subset of the server's tools
+        is selected (per-tool enablement, e.g. a skill binding a subset of a
+        Canvas server's tools). A scoped lookup id (``base::tool``) therefore
+        never matches a stored key directly, so collapse it to its base and
+        match that, tolerating the ``|allow:`` suffix:
+        ``collect_tool_name_filters`` folds every scoped id for one server into
+        a single client per agent build, so the base uniquely identifies it.
+
+        Without this, a skill that bound a *subset* of an external MCP server
+        resolved to no client at fold time → the skill folded zero tools and
+        the model reported the server "not connected" (the OAuth consent gate
+        never fired because no FoldedMCPTool existed to trigger it).
+        """
+        base = base_tool_id(tool_id)
+        # Exact keys win — a whole-server binding has no "|allow:" suffix.
+        exact_keys = [f"{user_id}:{base}", base] if user_id else [base]
+        for key in exact_keys:
+            if key in self.clients:
+                return self.clients[key]
+        # Subset-scoped fallback: cache key is "<base>|allow:<names>".
+        for key in exact_keys:
+            prefix = f"{key}|allow:"
+            for cache_key, client in self.clients.items():
+                if cache_key.startswith(prefix):
+                    return client
+        return None
 
     def add_to_tool_list(self, tools: List[Any]) -> List[Any]:
         for client in self.clients.values():

@@ -8,6 +8,8 @@ from apis.shared.auth.models import User
 from .models import AppRole, EffectivePermissions, AppRoleCreate, AppRoleUpdate
 from .repository import AppRoleRepository
 from .cache import AppRoleCache, get_app_role_cache
+from .role_constraints import validate_jwt_role_mappings
+from .version import bump_roles_version
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +62,10 @@ class AppRoleAdminService:
         Raises:
             ValueError: If role already exists or validation fails
         """
+        # Reject ubiquitous JWT mappings on protected roles and any
+        # malformed entries, regardless of role.
+        validate_jwt_role_mappings(role_data.role_id, role_data.jwt_role_mappings)
+
         # Build the AppRole object
         role = AppRole(
             role_id=role_data.role_id,
@@ -69,6 +75,7 @@ class AppRoleAdminService:
             inherits_from=role_data.inherits_from,
             granted_tools=role_data.granted_tools,
             granted_models=role_data.granted_models,
+            granted_skills=role_data.granted_skills,
             priority=role_data.priority,
             enabled=role_data.enabled,
             is_system_role=False,
@@ -138,6 +145,11 @@ class AppRoleAdminService:
                 filtered = {k: v for k, v in update_dict.items() if k in allowed_fields}
                 updates = AppRoleUpdate(**filtered)
 
+        # Validate any incoming jwt_role_mappings against format and
+        # protected-role rules before applying.
+        if updates.jwt_role_mappings is not None:
+            validate_jwt_role_mappings(role_id, updates.jwt_role_mappings)
+
         # Apply updates
         update_dict = updates.model_dump(exclude_unset=True, by_alias=False)
         for field, value in update_dict.items():
@@ -201,6 +213,7 @@ class AppRoleAdminService:
             await self.cache.invalidate_role(role_id)
             for jwt_role in existing.jwt_role_mappings:
                 await self.cache.invalidate_jwt_mapping(jwt_role)
+            bump_roles_version()
 
             logger.info(
                 f"Admin {admin.email} deleted role: {role_id}",
@@ -270,6 +283,7 @@ class AppRoleAdminService:
         """
         all_tools: Set[str] = set(role.granted_tools)
         all_models: Set[str] = set(role.granted_models)
+        all_skills: Set[str] = set(role.granted_skills)
 
         # Process inherited roles (single level only)
         for parent_role_id in role.inherits_from:
@@ -277,10 +291,12 @@ class AppRoleAdminService:
             if parent and parent.enabled:
                 all_tools.update(parent.granted_tools)
                 all_models.update(parent.granted_models)
+                all_skills.update(parent.granted_skills)
 
         return EffectivePermissions(
             tools=list(all_tools),
             models=list(all_models),
+            skills=list(all_skills),
             quota_tier=None,  # Quota tier comes from direct configuration
         )
 
@@ -298,6 +314,10 @@ class AppRoleAdminService:
         await self.cache.invalidate_role(role.role_id)
         for jwt_role in role.jwt_role_mappings:
             await self.cache.invalidate_jwt_mapping(jwt_role)
+        # Bump the cross-cache watermark so any process holding a cached
+        # user profile for an affected user re-reads from the store on the
+        # next request rather than waiting for the TTL to expire.
+        bump_roles_version()
 
     # =========================================================================
     # Tool Management Extensions
@@ -422,6 +442,135 @@ class AppRoleAdminService:
                         "event": "tool_removed_from_role",
                         "role_id": role_id,
                         "tool_id": tool_id,
+                        "admin_user_id": admin.user_id,
+                    },
+                )
+                return updated
+
+        return role
+
+    # =========================================================================
+    # Skill Management Extensions (mirror of the tool management methods)
+    # =========================================================================
+
+    async def get_roles_granting_skill(self, skill_id: str) -> List[dict]:
+        """
+        Query which AppRoles grant access to a specific skill.
+        Reuses GSI2 (ToolRoleMappingIndex) with a `SKILL#` partition value.
+
+        Args:
+            skill_id: The skill identifier
+
+        Returns:
+            List of role info dicts with roleId, displayName, grantType, etc.
+        """
+        results = await self.repository.get_roles_for_skill(skill_id)
+
+        roles = []
+        for item in results:
+            role_id = item.get("roleId")
+            if not role_id:
+                continue
+
+            role = await self.get_role(role_id)
+            if not role:
+                continue
+
+            # Determine if grant is direct or inherited
+            grant_type = "direct" if skill_id in role.granted_skills else "inherited"
+            inherited_from = None
+
+            if grant_type == "inherited":
+                # Find which parent role provides this skill
+                for parent_id in role.inherits_from:
+                    parent = await self.get_role(parent_id)
+                    if parent and skill_id in parent.effective_permissions.skills:
+                        inherited_from = parent_id
+                        break
+
+            roles.append({
+                "roleId": role.role_id,
+                "displayName": role.display_name,
+                "grantType": grant_type,
+                "inheritedFrom": inherited_from,
+                "enabled": role.enabled,
+            })
+
+        return roles
+
+    async def add_skill_to_role(
+        self, role_id: str, skill_id: str, admin: User
+    ) -> AppRole:
+        """
+        Add a skill to a role's grantedSkills.
+        Triggers permission recomputation.
+
+        Args:
+            role_id: Role identifier
+            skill_id: Skill identifier
+            admin: Admin user performing the action
+
+        Returns:
+            Updated AppRole
+
+        Raises:
+            ValueError: If role not found
+        """
+        role = await self.get_role(role_id)
+        if not role:
+            raise ValueError(f"Role '{role_id}' not found")
+
+        if skill_id not in role.granted_skills:
+            new_skills = role.granted_skills + [skill_id]
+            updates = AppRoleUpdate(granted_skills=new_skills)
+            updated = await self.update_role(role_id, updates, admin)
+            if updated:
+                logger.info(
+                    f"Admin {admin.email} added skill {skill_id} to role {role_id}",
+                    extra={
+                        "event": "skill_added_to_role",
+                        "role_id": role_id,
+                        "skill_id": skill_id,
+                        "admin_user_id": admin.user_id,
+                    },
+                )
+                return updated
+
+        return role
+
+    async def remove_skill_from_role(
+        self, role_id: str, skill_id: str, admin: User
+    ) -> AppRole:
+        """
+        Remove a skill from a role's grantedSkills.
+        Triggers permission recomputation.
+
+        Args:
+            role_id: Role identifier
+            skill_id: Skill identifier
+            admin: Admin user performing the action
+
+        Returns:
+            Updated AppRole
+
+        Raises:
+            ValueError: If role not found
+        """
+        role = await self.get_role(role_id)
+        if not role:
+            raise ValueError(f"Role '{role_id}' not found")
+
+        if skill_id in role.granted_skills:
+            new_skills = [s for s in role.granted_skills if s != skill_id]
+            updates = AppRoleUpdate(granted_skills=new_skills)
+            updated = await self.update_role(role_id, updates, admin)
+            if updated:
+                logger.info(
+                    f"Admin {admin.email} removed skill {skill_id} from role {role_id}",
+                    extra={
+                        "event": "skill_removed_from_role",
+                        "role_id": role_id,
+                        "skill_id": skill_id,
                         "admin_user_id": admin.user_id,
                     },
                 )

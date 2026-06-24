@@ -107,11 +107,27 @@ class PausedTurnSnapshot(BaseModel):
     caching_enabled: Optional[bool] = Field(default=None, alias="cachingEnabled")
     max_tokens: Optional[int] = Field(default=None, alias="maxTokens")
     agent_type: Optional[str] = Field(default=None, alias="agentType")
+    enabled_skills: Optional[List[str]] = Field(
+        default=None,
+        alias="enabledSkills",
+        description="Effective skill ids the paused skill turn was built with. "
+                    "Resume rebuilds the same skills_hash cache key from these "
+                    "even if the user toggles skills mid-pause. None on chat "
+                    "turns and on snapshots written before the field existed "
+                    "(those fall back to request-time resolution).",
+    )
     inference_params: Optional[Dict[str, Any]] = Field(
         default=None,
         alias="inferenceParams",
         description="Canonical inference param dict captured at pause. When present, "
                     "supersedes the legacy temperature/max_tokens fields on resume."
+    )
+    mantle_endpoint_path: Optional[str] = Field(
+        default=None,
+        alias="mantleEndpointPath",
+        description="Bedrock Mantle endpoint path ('/v1' or '/openai/v1') captured at "
+                    "pause so a resumed Mantle turn rebuilds the same base URL. None for "
+                    "non-Mantle turns and snapshots written before the field existed.",
     )
     captured_at: str = Field(..., alias="capturedAt", description="ISO 8601 timestamp when the turn paused")
     expires_at: str = Field(..., alias="expiresAt", description="ISO 8601 timestamp after which the snapshot is no longer valid for resume")
@@ -126,6 +142,7 @@ class SessionPreferences(BaseModel):
     selected_prompt_id: Optional[str] = Field(default=None, alias="selectedPromptId", description="ID of selected prompt template")
     custom_prompt_text: Optional[str] = Field(default=None, alias="customPromptText", description="Custom prompt text if used")
     assistant_id: Optional[str] = Field(default=None, alias="assistantId", description="Assistant ID attached to this session")
+    agent_type: Optional[str] = Field(default=None, alias="agentType", description="Agent mode this conversation runs in ('skill' or 'chat'); reopening the session restores it")
 
     # System prompt hash for tracking exact prompt version sent to the model
     # This is a hash of the FINAL rendered system prompt (after date injection, variable substitution, etc.)
@@ -231,10 +248,11 @@ class UpdateSessionMetadataRequest(BaseModel):
     tags: Optional[List[str]] = Field(None, description="Custom tags")
     last_model: Optional[str] = Field(None, alias="lastModel", description="Last model used")
     enabled_tools: Optional[List[str]] = Field(None, alias="enabledTools", description="Enabled tools list")
-    selected_prompt_id: Optional[str] = Field(None, alias="selectedPromptId", description="Selected prompt ID")
+    selected_prompt_id: Optional[str] = Field(None, alias="selectedPromptId", description="ID of selected prompt — send null to explicitly clear, omit to leave unchanged")
     custom_prompt_text: Optional[str] = Field(None, alias="customPromptText", description="Custom prompt text")
     system_prompt_hash: Optional[str] = Field(None, alias="systemPromptHash", description="MD5 hash of final rendered system prompt")
     assistant_id: Optional[str] = Field(None, alias="assistantId", description="Assistant ID attached to this session")
+    agent_type: Optional[Literal["skill", "chat"]] = Field(None, alias="agentType", description="Agent mode for this conversation")
 
 
 class SessionMetadataResponse(BaseModel):
@@ -479,4 +497,9 @@ class MessagesListResponse(BaseModel):
         default_factory=list,
         alias="pendingInterrupts",
         description="OAuth consent interrupts that paused agent turns in this session and are awaiting user action",
+    )
+    ui_resources: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        alias="uiResources",
+        description="Persisted MCP App UI resources (SEP-1865) for this session, each shaped like the inline `ui_resource` SSE event ({type, toolUseId, resourceUri, html, mimeType, csp, permissions, sandboxOrigin}). Replayed on load to re-seed McpAppStateService and re-instantiate the mcp-app-frame iframe. Returned only on the first page.",
     )

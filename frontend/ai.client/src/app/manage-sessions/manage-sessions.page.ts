@@ -76,8 +76,16 @@ const MAX_SELECTION = 20;
         <div class="mb-6 flex flex-wrap items-center justify-between gap-4 rounded-lg border border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-gray-800">
           <div class="flex items-center gap-3">
             <span class="text-sm/6 font-medium text-gray-900 dark:text-white">
-              {{ selectedCount() }} of {{ maxSelection }} selected
+              {{ selectedCount() }} {{ selectedCount() === 1 ? 'item' : 'items' }} selected
             </span>
+            <button
+              type="button"
+              (click)="selectAll()"
+              [disabled]="sessions().length === 0"
+              class="text-sm/6 font-medium text-blue-600 hover:text-blue-700 disabled:cursor-not-allowed disabled:opacity-50 dark:text-blue-400 dark:hover:text-blue-300"
+            >
+              Select all
+            </button>
             @if (selectedCount() > 0) {
               <button
                 type="button"
@@ -366,6 +374,13 @@ export class ManageSessionsPage implements OnInit {
       }
       return newIds;
     });
+  }
+
+  selectAll(): void {
+    const ids = this.sessions()
+      .slice(0, this.maxSelection)
+      .map(s => s.sessionId);
+    this.selectedSessionIds.set(new Set(ids));
   }
 
   clearSelection(): void {

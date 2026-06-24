@@ -11,12 +11,25 @@ from agents.main_agent.config.constants import EnvVars, Defaults
 
 logger = logging.getLogger(__name__)
 
+# Anthropic "fine-grained tool streaming" beta. WITHOUT it, Bedrock/Anthropic
+# BUFFERS a tool_use block's input JSON and flushes every `input_json_delta`
+# in one burst once the block is complete; WITH it, the deltas stream as the
+# model generates them. Required for MCP Apps (SEP-1865) progressive
+# tool-input rendering — see `ModelConfig.to_bedrock_config`.
+_FINE_GRAINED_TOOL_STREAMING_BETA = "fine-grained-tool-streaming-2025-05-14"
+
 
 class ModelProvider(str, Enum):
     """Supported LLM providers"""
     BEDROCK = "bedrock"
     OPENAI = "openai"
     GEMINI = "gemini"
+    # Bedrock Mantle — AWS's OpenAI-compatible inference surface for
+    # Bedrock-hosted open-weight models (`bedrock-mantle.<region>.api.aws`).
+    # Distinct from BEDROCK because it rides the OpenAI wire protocol with a
+    # bearer token, not the Converse API with SigV4. Never auto-detected from
+    # model_id — admins set it explicitly on the managed model.
+    MANTLE = "mantle"
 
 
 # Canonical param name -> provider-native key path (dot-separated for nested SDK fields).
@@ -38,6 +51,16 @@ _BEDROCK_PARAM_MAP: Dict[str, str] = {
 }
 
 _OPENAI_PARAM_MAP: Dict[str, str] = {
+    "temperature": "temperature",
+    "top_p": "top_p",
+    "max_tokens": "max_tokens",
+    "reasoning_effort": "reasoning_effort",
+}
+
+# Mantle speaks the OpenAI chat-completions protocol, so the canonical->native
+# mapping mirrors OpenAI's. Kept separate so Mantle-specific divergence (e.g.
+# params some open-weight models reject) has a home without touching OpenAI.
+_MANTLE_PARAM_MAP: Dict[str, str] = {
     "temperature": "temperature",
     "top_p": "top_p",
     "max_tokens": "max_tokens",
@@ -70,7 +93,10 @@ _INTEGER_CANONICAL_PARAMS: frozenset[str] = frozenset({"max_tokens", "top_k"})
 # to bypass that by inventing keys the admin hasn't seen yet (or that the
 # provider mapping starts forwarding in a future release).
 KNOWN_CANONICAL_PARAMS: frozenset[str] = frozenset(
-    set(_BEDROCK_PARAM_MAP) | set(_OPENAI_PARAM_MAP) | set(_GEMINI_PARAM_MAP)
+    set(_BEDROCK_PARAM_MAP)
+    | set(_OPENAI_PARAM_MAP)
+    | set(_GEMINI_PARAM_MAP)
+    | set(_MANTLE_PARAM_MAP)
 )
 
 
@@ -246,6 +272,10 @@ class ModelConfig:
     provider: ModelProvider = ModelProvider.BEDROCK
     inference_params: Dict[str, Any] = field(default_factory=dict)
     retry_config: Optional[RetryConfig] = None
+    # Bedrock Mantle endpoint path (``/v1`` or ``/openai/v1``). Only consulted
+    # on the MANTLE provider path, where it selects the base URL the OpenAI
+    # client targets. ``None`` falls back to ``/v1`` in the agent factory.
+    mantle_endpoint_path: Optional[str] = None
 
     def get_provider(self) -> ModelProvider:
         """
@@ -280,16 +310,31 @@ class ModelConfig:
             config, self.inference_params, _BEDROCK_PARAM_MAP, "bedrock", self.model_id
         )
 
-        # Bedrock prompt caching is intentionally deferred. The previous SDK
-        # blocker — strands PR #1438, which fixed `cachePoint` blocks landing
-        # alongside non-PDF document attachments — is resolved in
-        # strands-agents 1.39.0, so the technical barrier is gone. Re-enabling
-        # is being held for a separate, scoped rollout (cost/badge impact is
-        # user-visible the moment caching turns on).
+        # Native Bedrock CountTokens. With this on, Strands' per-turn estimate
+        # (BeforeModelCallEvent.projected_input_tokens) and agent.model.count_tokens()
+        # return authoritative Bedrock counts instead of the chars/4 heuristic —
+        # the foundation for per-turn context attribution (decomposing the
+        # otherwise-aggregate inputTokens into system / tools / messages via the
+        # CountTokens differential). Every catalog model is Claude family and
+        # supports the API; the runtime-role IAM grant landed in #428. Strands
+        # falls back to the heuristic and caches the skip if a model ever
+        # AccessDenies or doesn't support counting, so this is safe to set
+        # unconditionally on the Bedrock path.
+        config["use_native_token_count"] = True
+
+        # Bedrock prompt caching. CacheConfig(strategy="auto") lets Strands
+        # place cache points per-model: for a model that supports automatic
+        # caching it injects a cachePoint on the system/tools/last-user blocks;
+        # for one that doesn't it logs a warning and no-ops, so this is safe to
+        # set whenever caching is enabled. The earlier SDK blocker — strands PR
+        # #1438, where `cachePoint` blocks collided with non-PDF document
+        # attachments — was fixed in strands-agents 1.39.0 (we pin 1.40.0).
+        # Cache hits are user-visible in the cost/context badge the moment this
+        # is on.
         # See: https://github.com/strands-agents/sdk-python/pull/1438
-        # if self.caching_enabled:
-        #     from strands.models import CacheConfig
-        #     config["cache_config"] = CacheConfig(strategy="auto")
+        if self.caching_enabled:
+            from strands.models import CacheConfig
+            config["cache_config"] = CacheConfig(strategy="auto")
 
         if self.retry_config:
             from botocore.config import Config as BotocoreConfig
@@ -302,6 +347,33 @@ class ModelConfig:
                 read_timeout=self.retry_config.read_timeout,
             )
 
+        # MCP Apps (SEP-1865) progressive tool-input streaming. By default
+        # Bedrock/Anthropic buffers a tool_use block's input JSON and flushes
+        # every `input_json_delta` in one burst once the block is complete —
+        # verified directly against `converse_stream`: a ~5.6KB `create_view`
+        # input arrives as a single ~1s burst after ~10s of silence, which
+        # defeats an App that renders progressively as arguments arrive (the
+        # camera tour flashes all at once). Anthropic's fine-grained tool
+        # streaming beta emits the input deltas as the model generates them
+        # (same input verified spread evenly over ~8s), so the host's
+        # `ui_tool_input_partial` relay flows in true real time. Scoped to
+        # Bedrock Anthropic (Claude) models and gated on the MCP Apps host
+        # flag — the only feature that needs it — so opted-out environments
+        # keep Anthropic's default JSON-validated tool input. Merge into any
+        # existing `additional_request_fields` (thinking/top_k/effort) rather
+        # than clobbering it.
+        if "claude" in self.model_id.lower():
+            from agents.main_agent.integrations.mcp_apps import (
+                is_mcp_apps_host_enabled,
+            )
+
+            if is_mcp_apps_host_enabled():
+                arf = config.setdefault("additional_request_fields", {})
+                betas = list(arf.get("anthropic_beta") or [])
+                if _FINE_GRAINED_TOOL_STREAMING_BETA not in betas:
+                    betas.append(_FINE_GRAINED_TOOL_STREAMING_BETA)
+                arf["anthropic_beta"] = betas
+
         return config
 
     def to_openai_config(self) -> Dict[str, Any]:
@@ -309,6 +381,22 @@ class ModelConfig:
         params: Dict[str, Any] = {}
         _apply_canonical_params(
             params, self.inference_params, _OPENAI_PARAM_MAP, "openai", self.model_id
+        )
+        config: Dict[str, Any] = {"model_id": self.model_id}
+        if params:
+            config["params"] = params
+        return config
+
+    def to_mantle_config(self) -> Dict[str, Any]:
+        """Convert to OpenAIModel kwargs for Bedrock Mantle.
+
+        Mantle is OpenAI-wire-compatible, so the output feeds the same
+        Strands ``OpenAIModel`` — only the client (base_url + bearer token)
+        differs, and that's the factory's job.
+        """
+        params: Dict[str, Any] = {}
+        _apply_canonical_params(
+            params, self.inference_params, _MANTLE_PARAM_MAP, "mantle", self.model_id
         )
         config: Dict[str, Any] = {"model_id": self.model_id}
         if params:
@@ -333,6 +421,7 @@ class ModelConfig:
             "caching_enabled": self.caching_enabled,
             "provider": self.get_provider().value,
             "inference_params": dict(self.inference_params),
+            "mantle_endpoint_path": self.mantle_endpoint_path,
         }
 
     @classmethod
@@ -342,16 +431,19 @@ class ModelConfig:
         caching_enabled: Optional[bool] = None,
         provider: Optional[str] = None,
         inference_params: Optional[Dict[str, Any]] = None,
+        mantle_endpoint_path: Optional[str] = None,
     ) -> "ModelConfig":
         """Create ModelConfig from optional parameters.
 
         Args:
             model_id: Model ID (provider-specific format)
             caching_enabled: Whether to enable prompt caching (Bedrock only)
-            provider: Provider name ("bedrock", "openai", or "gemini")
+            provider: Provider name ("bedrock", "openai", "gemini", or "mantle")
             inference_params: Canonical-name -> value map (temperature, top_p,
                 max_tokens, thinking, ...). Each provider's translation table
                 drops unsupported keys silently.
+            mantle_endpoint_path: Bedrock Mantle endpoint path ("/v1" or
+                "/openai/v1"). Only consulted on the MANTLE provider path.
         """
         provider_enum = ModelProvider.BEDROCK
         if provider:
@@ -365,4 +457,5 @@ class ModelConfig:
             caching_enabled=caching_enabled if caching_enabled is not None else cls.caching_enabled,
             provider=provider_enum,
             inference_params=dict(inference_params) if inference_params else {},
+            mantle_endpoint_path=mantle_endpoint_path,
         )

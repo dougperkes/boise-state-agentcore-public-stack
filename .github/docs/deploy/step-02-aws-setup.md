@@ -107,7 +107,7 @@ This allows the certificate to cover subdomains like `api.example.com` and `app.
 | Certificate | Region | Used By |
 |-------------|--------|---------|
 | **ALB certificate** | Your deployment region (e.g. `us-west-2`) | Application Load Balancer (`api.example.com`) |
-| **CloudFront certificate** | `us-east-1` (required) | Frontend CDN (`app.example.com`) |
+| **CloudFront certificate** | `us-east-1` (required) | All CloudFront origins via `CDK_CLOUDFRONT_CERTIFICATE_ARN`: SPA (`app.example.com`), artifacts (`artifacts.example.com`), MCP sandbox (`mcp-sandbox.example.com`) |
 
 > [!IMPORTANT]
 > The CloudFront certificate **must** be in `us-east-1`, regardless of your deployment region. This is an AWS requirement.
@@ -134,11 +134,18 @@ This allows the certificate to cover subdomains like `api.example.com` and `app.
 - `CloudFront Certificate ARN` (e.g. `arn:aws:acm:us-east-1:123456789012:certificate/def-456`)
 
 > [!IMPORTANT]
-> **If you plan to enable the optional Artifacts stack, mind the wildcard depth.** A TLS wildcard covers **exactly one** label — `*.example.com` matches `artifacts.example.com` but **not** `artifacts.alpha.example.com`.
-> - If `CDK_DOMAIN_NAME` is your **apex** (e.g. `example.com`), the artifact origin is `artifacts.example.com` and the existing `*.example.com` CloudFront cert covers it — reuse that cert ARN, no third certificate needed.
-> - If `CDK_DOMAIN_NAME` is **already a subdomain** (e.g. `alpha.example.com`), the artifact origin is `artifacts.alpha.example.com`, which `*.example.com` does **not** cover. Issue a dedicated `us-east-1` cert for `*.alpha.example.com` (or exactly `artifacts.alpha.example.com`) and use that ARN for `CDK_ARTIFACTS_CERTIFICATE_ARN`.
+> **One CloudFront cert covers all three edge origins.** The stack provisions three CloudFront origins that need TLS in `us-east-1`: the SPA (`{CDK_DOMAIN_NAME}`), the artifact iframes (`artifacts.{CDK_DOMAIN_NAME}`), and the MCP Apps sandbox shell (`mcp-sandbox.{CDK_DOMAIN_NAME}`). A single `us-east-1` certificate whose SANs are **both** `{CDK_DOMAIN_NAME}` **and** `*.{CDK_DOMAIN_NAME}` covers all three. Supply it once via **`CDK_CLOUDFRONT_CERTIFICATE_ARN`** (see [Step 3b](./step-03-github-config.md)) — every CloudFront origin falls back to it. You only need the per-origin vars (`CDK_FRONTEND_CERTIFICATE_ARN`, `CDK_ARTIFACTS_CERTIFICATE_ARN`, `CDK_MCP_SANDBOX_CERTIFICATE_ARN`) if you deliberately want to override one origin with a different cert.
 >
-> Verify before deploying: `aws acm describe-certificate --region us-east-1 --certificate-arn <arn> --query 'Certificate.SubjectAlternativeNames'` should list a SAN that matches `artifacts.{CDK_DOMAIN_NAME}`.
+> **Mind the wildcard depth.** A TLS wildcard covers **exactly one** label — `*.example.com` matches `artifacts.example.com` but **not** `artifacts.alpha.example.com`.
+> - If `CDK_DOMAIN_NAME` is your **apex** (e.g. `example.com`), the subdomain origins are `artifacts.example.com` / `mcp-sandbox.example.com`; a `*.example.com` wildcard covers them. But the SPA serves at the bare apex `example.com`, which a wildcard does **not** match — so the shared cert needs **both** `example.com` and `*.example.com` as SANs (exactly the two names you added above).
+> - If `CDK_DOMAIN_NAME` is **already a subdomain** (e.g. `alpha.example.com`), the origins are `alpha.example.com` / `artifacts.alpha.example.com` / `mcp-sandbox.alpha.example.com`, which `*.example.com` does **not** cover. Issue a dedicated `us-east-1` cert whose SANs are `alpha.example.com` **and** `*.alpha.example.com`, and use that ARN for `CDK_CLOUDFRONT_CERTIFICATE_ARN`.
+>
+> Verify before deploying — the cert must cover the apex/SPA domain **and** the subdomain origins:
+> ```bash
+> aws acm describe-certificate --region us-east-1 --certificate-arn <arn> \
+>   --query 'Certificate.SubjectAlternativeNames'
+> ```
+> The SANs must include `{CDK_DOMAIN_NAME}`, `artifacts.{CDK_DOMAIN_NAME}`, and `mcp-sandbox.{CDK_DOMAIN_NAME}` (a `{CDK_DOMAIN_NAME}` + `*.{CDK_DOMAIN_NAME}` pair covers all three). A domained deploy whose CloudFront cert is missing now **fails at `cdk synth`** rather than shipping an unreachable origin.
 
 <details>
 <summary>My certificate is stuck in "Pending validation"</summary>

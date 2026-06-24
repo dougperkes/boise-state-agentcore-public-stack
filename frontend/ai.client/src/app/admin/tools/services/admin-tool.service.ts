@@ -11,6 +11,7 @@ import {
   ToolRoleAssignment,
   MCPDiscoverRequest,
   MCPDiscoverResponse,
+  GatewayTargetStatus,
 } from '../models/admin-tool.model';
 
 /**
@@ -211,6 +212,31 @@ export class AdminToolService {
   async discoverMCPTools(request: MCPDiscoverRequest): Promise<MCPDiscoverResponse> {
     return firstValueFrom(
       this.http.post<MCPDiscoverResponse>(`${this.baseUrl()}/discover`, request)
+    );
+  }
+
+  /**
+   * List the individual tools a *saved* catalog tool exposes. Used by the
+   * skills picker to drive per-tool binding for an MCP server whose tools
+   * aren't enumerated in the catalog (discovered live).
+   */
+  async discoverSavedToolTools(toolId: string): Promise<MCPDiscoverResponse> {
+    return firstValueFrom(
+      this.http.post<MCPDiscoverResponse>(`${this.baseUrl()}/${toolId}/discover`, {})
+    );
+  }
+
+  /**
+   * Fetch the live AgentCore Gateway health for a protocol='mcp' tool. The
+   * gateway syncs a target asynchronously after registration, so this is how
+   * the UI learns a target FAILED (e.g. the gateway role can't invoke the
+   * endpoint) rather than leaving it invisible.
+   */
+  async getGatewayTargetStatus(toolId: string): Promise<GatewayTargetStatus> {
+    return firstValueFrom(
+      this.http.get<GatewayTargetStatus>(
+        `${this.baseUrl()}/${toolId}/gateway-status`
+      )
     );
   }
 }

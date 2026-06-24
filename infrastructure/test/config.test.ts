@@ -10,13 +10,45 @@ import { loadConfig, AppConfig } from '../lib/config';
  * **Validates: Requirements 4.1-4.10**
  */
 
+/**
+ * The `CDK_RAG_*` environment variables these tests manipulate. They are
+ * deleted before AND after every test so a value set in one test can never
+ * leak into the next and silently change loadConfig()'s outcome.
+ *
+ * This explicit per-key deletion — not whole-object `process.env = snapshot`
+ * reassignment — is the load-bearing teardown: assigning a plain object to
+ * `process.env` does NOT reliably *delete* keys on every Node version (some
+ * merge the object in rather than replacing the backing store). Relying on
+ * that alone let leaked `CDK_RAG_*` values mask the variable under test, so the
+ * validation cases (e.g. an empty embedding model) saw a stale valid value and
+ * loadConfig() never threw.
+ */
+const RAG_ENV_KEYS = [
+  'CDK_RAG_CORS_ORIGINS',
+  'CDK_RAG_LAMBDA_MEMORY',
+  'CDK_RAG_LAMBDA_TIMEOUT',
+  'CDK_RAG_EMBEDDING_MODEL',
+  'CDK_RAG_VECTOR_DIMENSION',
+  'CDK_RAG_DISTANCE_METRIC',
+] as const;
+
+function clearRagEnv(): void {
+  for (const key of RAG_ENV_KEYS) {
+    delete process.env[key];
+  }
+}
+
 describe('RAG Ingestion Configuration', () => {
   let app: cdk.App;
   let originalEnv: NodeJS.ProcessEnv;
 
   beforeEach(() => {
-    // Save original environment
+    // Save the original environment, then start each test from a fresh copy so
+    // mutations never touch the snapshot we restore from.
     originalEnv = { ...process.env };
+    process.env = { ...originalEnv };
+    // Hermetic start: drop any RAG keys a prior test may have leaked.
+    clearRagEnv();
 
     // Create a fresh CDK app for each test
     app = new cdk.App();
@@ -30,18 +62,15 @@ describe('RAG Ingestion Configuration', () => {
 
     // Set default context for other required fields
     app.node.setContext('frontend', {
-      enabled: true,
       cloudFrontPriceClass: 'PriceClass_100',
     });
     app.node.setContext('appApi', {
-      enabled: true,
       cpu: 256,
       memory: 512,
       desiredCount: 1,
       maxCapacity: 4,
     });
     app.node.setContext('inferenceApi', {
-      enabled: true,
       cpu: 256,
       memory: 512,
       desiredCount: 1,
@@ -49,18 +78,15 @@ describe('RAG Ingestion Configuration', () => {
       logLevel: 'INFO',
     });
     app.node.setContext('gateway', {
-      enabled: true,
       apiType: 'REST',
       throttleRateLimit: 1000,
       throttleBurstLimit: 2000,
       enableWaf: false,
     });
     app.node.setContext('assistants', {
-      enabled: true,
       additionalCorsOrigins: 'http://localhost:3000',
     });
     app.node.setContext('fileUpload', {
-      enabled: true,
       maxFileSizeBytes: 4194304,
       maxFilesPerMessage: 5,
       userQuotaBytes: 1073741824,
@@ -72,7 +98,6 @@ describe('RAG Ingestion Configuration', () => {
     // Since task 1 removed hardcoded defaults from loadConfig(), tests must
     // provide context defaults for fields they don't explicitly set via env vars.
     app.node.setContext('ragIngestion', {
-      enabled: true,
       additionalCorsOrigins: '',
       lambdaMemorySize: 10240,
       lambdaTimeout: 900,
@@ -83,7 +108,9 @@ describe('RAG Ingestion Configuration', () => {
   });
 
   afterEach(() => {
-    // Restore original environment
+    // Drop any RAG keys this test set so they can't leak forward, then restore
+    // the original environment object.
+    clearRagEnv();
     process.env = originalEnv;
   });
 
@@ -92,14 +119,6 @@ describe('RAG Ingestion Configuration', () => {
   // ============================================================
 
   describe('Environment Variable Loading', () => {
-    test('loads enabled flag from CDK_RAG_ENABLED environment variable', () => {
-      process.env.CDK_RAG_ENABLED = 'false';
-
-      const config = loadConfig(app);
-
-      expect(config.ragIngestion.enabled).toBe(false);
-    });
-
     test('loads CORS origins from CDK_RAG_CORS_ORIGINS environment variable', () => {
       process.env.CDK_RAG_CORS_ORIGINS = 'https://example.com,https://test.com';
 
@@ -149,7 +168,6 @@ describe('RAG Ingestion Configuration', () => {
     });
 
     test('loads all RAG configuration from environment variables', () => {
-      process.env.CDK_RAG_ENABLED = 'true';
       process.env.CDK_RAG_CORS_ORIGINS = 'https://prod.example.com';
       process.env.CDK_RAG_LAMBDA_MEMORY = '10240';
       process.env.CDK_RAG_LAMBDA_TIMEOUT = '900';
@@ -160,7 +178,6 @@ describe('RAG Ingestion Configuration', () => {
       const config = loadConfig(app);
 
       expect(config.ragIngestion).toEqual({
-        enabled: true,
         additionalCorsOrigins: 'https://prod.example.com',
         lambdaMemorySize: 10240,
         lambdaTimeout: 900,
@@ -178,7 +195,6 @@ describe('RAG Ingestion Configuration', () => {
   describe('Context Fallback', () => {
     test('falls back to context value when environment variable not set', () => {
       app.node.setContext('ragIngestion', {
-        enabled: false,
         additionalCorsOrigins: 'https://context.example.com',
         lambdaMemorySize: 8192,
         lambdaTimeout: 600,
@@ -190,7 +206,6 @@ describe('RAG Ingestion Configuration', () => {
       const config = loadConfig(app);
 
       expect(config.ragIngestion).toEqual({
-        enabled: false,
         additionalCorsOrigins: 'https://context.example.com',
         lambdaMemorySize: 8192,
         lambdaTimeout: 600,
@@ -202,7 +217,6 @@ describe('RAG Ingestion Configuration', () => {
 
     test('environment variable takes precedence over context', () => {
       app.node.setContext('ragIngestion', {
-        enabled: false,
         additionalCorsOrigins: 'https://context.example.com',
         lambdaMemorySize: 8192,
         lambdaTimeout: 900,
@@ -211,20 +225,17 @@ describe('RAG Ingestion Configuration', () => {
         vectorDistanceMetric: 'cosine',
       });
 
-      process.env.CDK_RAG_ENABLED = 'true';
       process.env.CDK_RAG_CORS_ORIGINS = 'https://env.example.com';
       process.env.CDK_RAG_LAMBDA_MEMORY = '10240';
 
       const config = loadConfig(app);
 
-      expect(config.ragIngestion.enabled).toBe(true);
       expect(config.ragIngestion.additionalCorsOrigins).toBe('https://env.example.com');
       expect(config.ragIngestion.lambdaMemorySize).toBe(10240);
     });
 
     test('uses context for some values and env for others', () => {
       app.node.setContext('ragIngestion', {
-        enabled: false,
         additionalCorsOrigins: 'https://context.example.com',
         lambdaMemorySize: 8192,
         lambdaTimeout: 600,
@@ -233,12 +244,10 @@ describe('RAG Ingestion Configuration', () => {
         vectorDistanceMetric: 'cosine',
       });
 
-      process.env.CDK_RAG_ENABLED = 'true';
       process.env.CDK_RAG_LAMBDA_MEMORY = '10240';
 
       const config = loadConfig(app);
 
-      expect(config.ragIngestion.enabled).toBe(true); // from env
       expect(config.ragIngestion.additionalCorsOrigins).toBe('https://context.example.com'); // from context
       expect(config.ragIngestion.lambdaMemorySize).toBe(10240); // from env
       expect(config.ragIngestion.lambdaTimeout).toBe(600); // from context
@@ -253,19 +262,12 @@ describe('RAG Ingestion Configuration', () => {
     test('uses default values when neither env nor context set', () => {
       const config = loadConfig(app);
 
-      expect(config.ragIngestion.enabled).toBe(true);
       expect(config.ragIngestion.additionalCorsOrigins).toBe('');
       expect(config.ragIngestion.lambdaMemorySize).toBe(10240);
       expect(config.ragIngestion.lambdaTimeout).toBe(900);
       expect(config.ragIngestion.embeddingModel).toBe('amazon.titan-embed-text-v2');
       expect(config.ragIngestion.vectorDimension).toBe(1024);
       expect(config.ragIngestion.vectorDistanceMetric).toBe('cosine');
-    });
-
-    test('default enabled is true', () => {
-      const config = loadConfig(app);
-
-      expect(config.ragIngestion.enabled).toBe(true);
     });
 
     test('default CORS origins is empty string', () => {
@@ -333,16 +335,14 @@ describe('RAG Ingestion Configuration', () => {
       testApp.node.setContext('awsRegion', 'us-east-1');
       testApp.node.setContext('awsAccount', '123456789012');
       testApp.node.setContext('vpcCidr', '10.0.0.0/16');
-      testApp.node.setContext('frontend', { enabled: true, cloudFrontPriceClass: 'PriceClass_100' });
-      testApp.node.setContext('appApi', { enabled: true, cpu: 256, memory: 512, desiredCount: 1, maxCapacity: 4 });
-      testApp.node.setContext('inferenceApi', { enabled: true, cpu: 256, memory: 512, desiredCount: 1, maxCapacity: 4, logLevel: 'INFO' });
-      testApp.node.setContext('gateway', { enabled: true, apiType: 'REST', throttleRateLimit: 1000, throttleBurstLimit: 2000, enableWaf: false });
-      testApp.node.setContext('assistants', { enabled: true, additionalCorsOrigins: 'http://localhost:3000' });
-      testApp.node.setContext('fileUpload', { enabled: true, maxFileSizeBytes: 4194304, maxFilesPerMessage: 5, userQuotaBytes: 1073741824, retentionDays: 365 });
+      testApp.node.setContext('frontend', { cloudFrontPriceClass: 'PriceClass_100' });
+      testApp.node.setContext('appApi', { cpu: 256, memory: 512, desiredCount: 1, maxCapacity: 4 });
+      testApp.node.setContext('inferenceApi', { cpu: 256, memory: 512, desiredCount: 1, maxCapacity: 4, logLevel: 'INFO' });
+      testApp.node.setContext('gateway', { apiType: 'REST', throttleRateLimit: 1000, throttleBurstLimit: 2000, enableWaf: false });
+      testApp.node.setContext('assistants', { additionalCorsOrigins: 'http://localhost:3000' });
+      testApp.node.setContext('fileUpload', { maxFileSizeBytes: 4194304, maxFilesPerMessage: 5, userQuotaBytes: 1073741824, retentionDays: 365 });
       
-      process.env.CDK_RAG_ENABLED = 'true'; // Enable RAG to trigger validation
       testApp.node.setContext('ragIngestion', {
-        enabled: true,
         additionalCorsOrigins: '',
         lambdaMemorySize: 10240,
         lambdaTimeout: -1, // Negative (invalid)
@@ -363,16 +363,14 @@ describe('RAG Ingestion Configuration', () => {
       testApp.node.setContext('awsRegion', 'us-east-1');
       testApp.node.setContext('awsAccount', '123456789012');
       testApp.node.setContext('vpcCidr', '10.0.0.0/16');
-      testApp.node.setContext('frontend', { enabled: true, cloudFrontPriceClass: 'PriceClass_100' });
-      testApp.node.setContext('appApi', { enabled: true, cpu: 256, memory: 512, desiredCount: 1, maxCapacity: 4 });
-      testApp.node.setContext('inferenceApi', { enabled: true, cpu: 256, memory: 512, desiredCount: 1, maxCapacity: 4, logLevel: 'INFO' });
-      testApp.node.setContext('gateway', { enabled: true, apiType: 'REST', throttleRateLimit: 1000, throttleBurstLimit: 2000, enableWaf: false });
-      testApp.node.setContext('assistants', { enabled: true, additionalCorsOrigins: 'http://localhost:3000' });
-      testApp.node.setContext('fileUpload', { enabled: true, maxFileSizeBytes: 4194304, maxFilesPerMessage: 5, userQuotaBytes: 1073741824, retentionDays: 365 });
+      testApp.node.setContext('frontend', { cloudFrontPriceClass: 'PriceClass_100' });
+      testApp.node.setContext('appApi', { cpu: 256, memory: 512, desiredCount: 1, maxCapacity: 4 });
+      testApp.node.setContext('inferenceApi', { cpu: 256, memory: 512, desiredCount: 1, maxCapacity: 4, logLevel: 'INFO' });
+      testApp.node.setContext('gateway', { apiType: 'REST', throttleRateLimit: 1000, throttleBurstLimit: 2000, enableWaf: false });
+      testApp.node.setContext('assistants', { additionalCorsOrigins: 'http://localhost:3000' });
+      testApp.node.setContext('fileUpload', { maxFileSizeBytes: 4194304, maxFilesPerMessage: 5, userQuotaBytes: 1073741824, retentionDays: 365 });
       
-      process.env.CDK_RAG_ENABLED = 'true'; // Enable RAG to trigger validation
       testApp.node.setContext('ragIngestion', {
-        enabled: true,
         additionalCorsOrigins: '',
         lambdaMemorySize: 10240,
         lambdaTimeout: 1000, // Too high
@@ -393,16 +391,14 @@ describe('RAG Ingestion Configuration', () => {
       testApp.node.setContext('awsRegion', 'us-east-1');
       testApp.node.setContext('awsAccount', '123456789012');
       testApp.node.setContext('vpcCidr', '10.0.0.0/16');
-      testApp.node.setContext('frontend', { enabled: true, cloudFrontPriceClass: 'PriceClass_100' });
-      testApp.node.setContext('appApi', { enabled: true, cpu: 256, memory: 512, desiredCount: 1, maxCapacity: 4 });
-      testApp.node.setContext('inferenceApi', { enabled: true, cpu: 256, memory: 512, desiredCount: 1, maxCapacity: 4, logLevel: 'INFO' });
-      testApp.node.setContext('gateway', { enabled: true, apiType: 'REST', throttleRateLimit: 1000, throttleBurstLimit: 2000, enableWaf: false });
-      testApp.node.setContext('assistants', { enabled: true, additionalCorsOrigins: 'http://localhost:3000' });
-      testApp.node.setContext('fileUpload', { enabled: true, maxFileSizeBytes: 4194304, maxFilesPerMessage: 5, userQuotaBytes: 1073741824, retentionDays: 365 });
+      testApp.node.setContext('frontend', { cloudFrontPriceClass: 'PriceClass_100' });
+      testApp.node.setContext('appApi', { cpu: 256, memory: 512, desiredCount: 1, maxCapacity: 4 });
+      testApp.node.setContext('inferenceApi', { cpu: 256, memory: 512, desiredCount: 1, maxCapacity: 4, logLevel: 'INFO' });
+      testApp.node.setContext('gateway', { apiType: 'REST', throttleRateLimit: 1000, throttleBurstLimit: 2000, enableWaf: false });
+      testApp.node.setContext('assistants', { additionalCorsOrigins: 'http://localhost:3000' });
+      testApp.node.setContext('fileUpload', { maxFileSizeBytes: 4194304, maxFilesPerMessage: 5, userQuotaBytes: 1073741824, retentionDays: 365 });
       
-      process.env.CDK_RAG_ENABLED = 'true'; // Enable RAG to trigger validation
       testApp.node.setContext('ragIngestion', {
-        enabled: true,
         additionalCorsOrigins: '',
         lambdaMemorySize: 10240,
         lambdaTimeout: 900,
@@ -457,16 +453,14 @@ describe('RAG Ingestion Configuration', () => {
       testApp.node.setContext('awsRegion', 'us-east-1');
       testApp.node.setContext('awsAccount', '123456789012');
       testApp.node.setContext('vpcCidr', '10.0.0.0/16');
-      testApp.node.setContext('frontend', { enabled: true, cloudFrontPriceClass: 'PriceClass_100' });
-      testApp.node.setContext('appApi', { enabled: true, cpu: 256, memory: 512, desiredCount: 1, maxCapacity: 4 });
-      testApp.node.setContext('inferenceApi', { enabled: true, cpu: 256, memory: 512, desiredCount: 1, maxCapacity: 4, logLevel: 'INFO' });
-      testApp.node.setContext('gateway', { enabled: true, apiType: 'REST', throttleRateLimit: 1000, throttleBurstLimit: 2000, enableWaf: false });
-      testApp.node.setContext('assistants', { enabled: true, additionalCorsOrigins: 'http://localhost:3000' });
-      testApp.node.setContext('fileUpload', { enabled: true, maxFileSizeBytes: 4194304, maxFilesPerMessage: 5, userQuotaBytes: 1073741824, retentionDays: 365 });
+      testApp.node.setContext('frontend', { cloudFrontPriceClass: 'PriceClass_100' });
+      testApp.node.setContext('appApi', { cpu: 256, memory: 512, desiredCount: 1, maxCapacity: 4 });
+      testApp.node.setContext('inferenceApi', { cpu: 256, memory: 512, desiredCount: 1, maxCapacity: 4, logLevel: 'INFO' });
+      testApp.node.setContext('gateway', { apiType: 'REST', throttleRateLimit: 1000, throttleBurstLimit: 2000, enableWaf: false });
+      testApp.node.setContext('assistants', { additionalCorsOrigins: 'http://localhost:3000' });
+      testApp.node.setContext('fileUpload', { maxFileSizeBytes: 4194304, maxFilesPerMessage: 5, userQuotaBytes: 1073741824, retentionDays: 365 });
       
-      process.env.CDK_RAG_ENABLED = 'true'; // Enable RAG to trigger validation
       testApp.node.setContext('ragIngestion', {
-        enabled: true,
         additionalCorsOrigins: '',
         lambdaMemorySize: 10240,
         lambdaTimeout: 900,
@@ -489,7 +483,6 @@ describe('RAG Ingestion Configuration', () => {
     });
 
     test('accepts valid configuration', () => {
-      process.env.CDK_RAG_ENABLED = 'true';
       process.env.CDK_RAG_CORS_ORIGINS = 'https://example.com';
       process.env.CDK_RAG_LAMBDA_MEMORY = '10240';
       process.env.CDK_RAG_LAMBDA_TIMEOUT = '900';
@@ -498,52 +491,6 @@ describe('RAG Ingestion Configuration', () => {
       process.env.CDK_RAG_DISTANCE_METRIC = 'cosine';
 
       expect(() => loadConfig(app)).not.toThrow();
-    });
-  });
-
-  // ============================================================
-  // Boolean Parsing Tests
-  // ============================================================
-
-  describe('Boolean Parsing', () => {
-    test('parses "true" string as boolean true', () => {
-      process.env.CDK_RAG_ENABLED = 'true';
-
-      const config = loadConfig(app);
-
-      expect(config.ragIngestion.enabled).toBe(true);
-    });
-
-    test('parses "false" string as boolean false', () => {
-      process.env.CDK_RAG_ENABLED = 'false';
-
-      const config = loadConfig(app);
-
-      expect(config.ragIngestion.enabled).toBe(false);
-    });
-
-    test('parses "TRUE" (uppercase) as boolean true', () => {
-      process.env.CDK_RAG_ENABLED = 'TRUE';
-
-      const config = loadConfig(app);
-
-      expect(config.ragIngestion.enabled).toBe(true);
-    });
-
-    test('parses "FALSE" (uppercase) as boolean false', () => {
-      process.env.CDK_RAG_ENABLED = 'FALSE';
-
-      const config = loadConfig(app);
-
-      expect(config.ragIngestion.enabled).toBe(false);
-    });
-
-    test('empty string falls back to context or default', () => {
-      process.env.CDK_RAG_ENABLED = '';
-
-      const config = loadConfig(app);
-
-      expect(config.ragIngestion.enabled).toBe(true); // default
     });
   });
 
@@ -638,7 +585,6 @@ describe('RAG Ingestion Configuration', () => {
     test('precedence order: env > context > default', () => {
       // Set context value
       app.node.setContext('ragIngestion', {
-        enabled: true,
         additionalCorsOrigins: '',
         lambdaMemorySize: 8192,
         lambdaTimeout: 900,
@@ -657,7 +603,6 @@ describe('RAG Ingestion Configuration', () => {
 
     test('context overrides default when env not set', () => {
       app.node.setContext('ragIngestion', {
-        enabled: true,
         additionalCorsOrigins: '',
         lambdaMemorySize: 8192,
         lambdaTimeout: 900,
@@ -679,7 +624,6 @@ describe('RAG Ingestion Configuration', () => {
 
     test('mixed precedence for different fields', () => {
       app.node.setContext('ragIngestion', {
-        enabled: false,
         additionalCorsOrigins: 'https://context.example.com',
         lambdaMemorySize: 8192,
         lambdaTimeout: 900,
@@ -688,13 +632,11 @@ describe('RAG Ingestion Configuration', () => {
         vectorDistanceMetric: 'cosine',
       });
 
-      process.env.CDK_RAG_ENABLED = 'true';
       // CDK_RAG_CORS_ORIGINS not set, should use context
       // CDK_RAG_LAMBDA_MEMORY not set, should use context
 
       const config = loadConfig(app);
 
-      expect(config.ragIngestion.enabled).toBe(true); // env
       expect(config.ragIngestion.additionalCorsOrigins).toBe('https://context.example.com'); // context
       expect(config.ragIngestion.lambdaMemorySize).toBe(8192); // context
       expect(config.ragIngestion.lambdaTimeout).toBe(900); // default
@@ -707,7 +649,6 @@ describe('RAG Ingestion Configuration', () => {
 
   describe('Edge Cases', () => {
     test('handles undefined environment variables', () => {
-      delete process.env.CDK_RAG_ENABLED;
       delete process.env.CDK_RAG_CORS_ORIGINS;
 
       expect(() => loadConfig(app)).not.toThrow();
@@ -721,7 +662,6 @@ describe('RAG Ingestion Configuration', () => {
 
     test('handles partial context values', () => {
       app.node.setContext('ragIngestion', {
-        enabled: false,
         additionalCorsOrigins: '',
         lambdaMemorySize: 10240,
         lambdaTimeout: 900,
@@ -732,16 +672,13 @@ describe('RAG Ingestion Configuration', () => {
 
       const config = loadConfig(app);
 
-      expect(config.ragIngestion.enabled).toBe(false); // from context
       expect(config.ragIngestion.lambdaMemorySize).toBe(10240); // from context
     });
 
     test('handles RAG disabled configuration', () => {
-      process.env.CDK_RAG_ENABLED = 'false';
 
       const config = loadConfig(app);
 
-      expect(config.ragIngestion.enabled).toBe(false);
       // Other fields should still be loaded
       expect(config.ragIngestion.lambdaMemorySize).toBe(10240);
     });
@@ -756,6 +693,94 @@ describe('RAG Ingestion Configuration', () => {
       // Load again and verify original value
       const config2 = loadConfig(app);
       expect(config2.ragIngestion.lambdaMemorySize).toBe(originalMemory);
+    });
+  });
+
+  // ============================================================
+  // CloudFront Certificate Resolution Tests
+  //
+  // A single shared CDK_CLOUDFRONT_CERTIFICATE_ARN must satisfy all
+  // three CloudFront origins (SPA / artifacts / mcp-sandbox), while a
+  // section-specific ARN still overrides per origin. This is the
+  // first-deploy footgun fix: one wildcard cert instead of three.
+  // ============================================================
+
+  describe('CloudFront Certificate Resolution', () => {
+    const SHARED = 'arn:aws:acm:us-east-1:123456789012:certificate/shared-wildcard';
+    const ARTIFACTS_SPECIFIC = 'arn:aws:acm:us-east-1:123456789012:certificate/artifacts-only';
+    const FRONTEND_SPECIFIC = 'arn:aws:acm:us-east-1:123456789012:certificate/frontend-only';
+
+    const CF_CERT_ENV_KEYS = [
+      'CDK_CLOUDFRONT_CERTIFICATE_ARN',
+      'CDK_FRONTEND_CERTIFICATE_ARN',
+      'CDK_ARTIFACTS_CERTIFICATE_ARN',
+      'CDK_MCP_SANDBOX_CERTIFICATE_ARN',
+    ];
+
+    function clearCfCertEnv(): void {
+      for (const key of CF_CERT_ENV_KEYS) {
+        delete process.env[key];
+      }
+    }
+
+    beforeEach(clearCfCertEnv);
+    afterEach(clearCfCertEnv);
+
+    test('shared cert flows to all three CloudFront origins when none are set individually', () => {
+      process.env.CDK_CLOUDFRONT_CERTIFICATE_ARN = SHARED;
+
+      const config = loadConfig(app);
+
+      expect(config.cloudfrontCertificateArn).toBe(SHARED);
+      expect(config.frontend.certificateArn).toBe(SHARED);
+      expect(config.artifacts.certificateArn).toBe(SHARED);
+      expect(config.mcpSandbox.certificateArn).toBe(SHARED);
+    });
+
+    test('section-specific cert overrides the shared cert per origin', () => {
+      process.env.CDK_CLOUDFRONT_CERTIFICATE_ARN = SHARED;
+      process.env.CDK_ARTIFACTS_CERTIFICATE_ARN = ARTIFACTS_SPECIFIC;
+      process.env.CDK_FRONTEND_CERTIFICATE_ARN = FRONTEND_SPECIFIC;
+
+      const config = loadConfig(app);
+
+      // Overridden origins keep their own cert...
+      expect(config.artifacts.certificateArn).toBe(ARTIFACTS_SPECIFIC);
+      expect(config.frontend.certificateArn).toBe(FRONTEND_SPECIFIC);
+      // ...while the un-overridden origin falls back to the shared cert.
+      expect(config.mcpSandbox.certificateArn).toBe(SHARED);
+    });
+
+    test('the shared cert resolves from CDK context when the env var is unset', () => {
+      app.node.setContext('cloudfrontCertificateArn', SHARED);
+
+      const config = loadConfig(app);
+
+      expect(config.frontend.certificateArn).toBe(SHARED);
+      expect(config.artifacts.certificateArn).toBe(SHARED);
+      expect(config.mcpSandbox.certificateArn).toBe(SHARED);
+    });
+
+    test('the env var takes precedence over context for the shared cert', () => {
+      app.node.setContext('cloudfrontCertificateArn', 'arn:aws:acm:us-east-1:123456789012:certificate/from-context');
+      process.env.CDK_CLOUDFRONT_CERTIFICATE_ARN = SHARED;
+
+      const config = loadConfig(app);
+
+      expect(config.mcpSandbox.certificateArn).toBe(SHARED);
+    });
+
+    test('no cert anywhere leaves every CloudFront origin undefined (guards live in the constructs, not loadConfig)', () => {
+      const config = loadConfig(app);
+
+      expect(config.cloudfrontCertificateArn).toBeUndefined();
+      expect(config.frontend.certificateArn).toBeUndefined();
+      expect(config.artifacts.certificateArn).toBeUndefined();
+      expect(config.mcpSandbox.certificateArn).toBeUndefined();
+      // loadConfig itself must not throw on a domain-without-cert config —
+      // that fail-loud behaviour is the constructs' responsibility, exercised
+      // only on full synth (see *-cert-guard.test.ts).
+      expect(() => loadConfig(app)).not.toThrow();
     });
   });
 });

@@ -35,6 +35,24 @@ export type MCPAuthType = 'none' | 'aws-iam' | 'api-key' | 'bearer-token' | 'oau
 export type A2AAuthType = 'none' | 'aws-iam' | 'agentcore' | 'api-key';
 
 /**
+ * AgentCore Gateway target listing mode. DYNAMIC disables 3LO + semantic search.
+ */
+export type GatewayListingMode = 'default' | 'dynamic';
+
+/**
+ * How the Gateway authenticates outbound to a target's MCP endpoint.
+ */
+export type GatewayCredentialType = 'none' | 'gateway_iam_role' | 'oauth' | 'api_key';
+
+/**
+ * OAuth grant the Gateway uses for an OAUTH-credentialed target.
+ */
+export type GatewayOAuthGrantType =
+  | 'authorization_code'
+  | 'client_credentials'
+  | 'token_exchange';
+
+/**
  * Tool status enum
  */
 export type ToolStatus = 'active' | 'deprecated' | 'disabled' | 'coming_soon';
@@ -78,6 +96,33 @@ export interface A2AAgentConfig {
 }
 
 /**
+ * Gateway target configuration for protocol='mcp' tools. Mirrors the Python
+ * MCPGatewayConfig. `targetId`/`gatewayArn` are AWS-assigned (present on
+ * responses, omitted on create/update requests).
+ */
+export interface MCPGatewayConfig {
+  targetName: string;
+  endpointUrl: string;
+  listingMode: GatewayListingMode;
+  credentialType: GatewayCredentialType;
+  credentialProviderArn?: string | null;
+  awsService?: string | null;
+  awsRegion?: string | null;
+  /**
+   * Name (or ARN) of the Lambda backing a GATEWAY_IAM_ROLE Function-URL target.
+   * Lets the platform grant the gateway role InvokeFunctionUrl on exactly this
+   * function at registration (no infra change). Same-account only.
+   */
+  lambdaFunctionName?: string | null;
+  oauthScopes: string[];
+  grantType: GatewayOAuthGrantType;
+  customParameters?: Record<string, string> | null;
+  tools: MCPToolEntry[];
+  targetId?: string | null;
+  gatewayArn?: string | null;
+}
+
+/**
  * Admin tool definition with role assignments.
  */
 export interface AdminTool {
@@ -99,6 +144,7 @@ export interface AdminTool {
   // External tool configurations
   mcpConfig?: MCPServerConfig | null;
   a2aConfig?: A2AAgentConfig | null;
+  mcpGatewayConfig?: MCPGatewayConfig | null;
 }
 
 /**
@@ -144,6 +190,7 @@ export interface ToolCreateRequest {
   enabledByDefault?: boolean;
   mcpConfig?: MCPServerConfig;
   a2aConfig?: A2AAgentConfig;
+  mcpGatewayConfig?: MCPGatewayConfig;
 }
 
 /**
@@ -161,6 +208,7 @@ export interface ToolUpdateRequest {
   enabledByDefault?: boolean;
   mcpConfig?: MCPServerConfig | null;
   a2aConfig?: A2AAgentConfig | null;
+  mcpGatewayConfig?: MCPGatewayConfig | null;
 }
 
 /**
@@ -180,6 +228,12 @@ export interface MCPDiscoverRequest {
   awsRegion?: string | null;
   apiKeyHeader?: string | null;
   secretArn?: string | null;
+  /**
+   * When true, discovery is signed with the admin's own OIDC token (matching
+   * the catalog `forwardAuthToken` flag) instead of SigV4 — for same-team MCP
+   * servers that validate a forwarded JWT (Lambda Function URL AuthType=NONE).
+   */
+  forwardAuthToken?: boolean;
 }
 
 /**
@@ -195,6 +249,21 @@ export interface DiscoveredMCPTool {
  */
 export interface MCPDiscoverResponse {
   tools: DiscoveredMCPTool[];
+}
+
+/**
+ * Live health of the AgentCore Gateway target backing a protocol='mcp' tool,
+ * from GET /api/admin/tools/{toolId}/gateway-status. The gateway connects to
+ * and lists the target's tools asynchronously after registration, so a tool
+ * can be 'active' yet unusable because its target FAILED to sync. `status` is
+ * the gateway target status (CREATING / READY / FAILED / UPDATE_UNSUCCESSFUL /
+ * MISSING); `statusReasons` explains an unhealthy target.
+ */
+export interface GatewayTargetStatus {
+  targetId: string;
+  status: string;
+  statusReasons: string[];
+  healthy: boolean;
 }
 
 /**
@@ -290,6 +359,33 @@ export const A2A_AUTH_TYPES: { value: A2AAuthType; label: string; description?: 
 ];
 
 /**
+ * Available Gateway target listing modes for dropdowns.
+ */
+export const GATEWAY_LISTING_MODES: { value: GatewayListingMode; label: string; description?: string }[] = [
+  { value: 'default', label: 'Default', description: 'Static tool listing — required for OAuth (3LO) and semantic search' },
+  { value: 'dynamic', label: 'Dynamic', description: 'Resolve tools at call time — disables 3LO and semantic search' },
+];
+
+/**
+ * Available Gateway outbound credential types for dropdowns.
+ */
+export const GATEWAY_CREDENTIAL_TYPES: { value: GatewayCredentialType; label: string; description?: string }[] = [
+  { value: 'none', label: 'None (public endpoint)', description: 'No outbound credentials — the endpoint is publicly reachable' },
+  { value: 'gateway_iam_role', label: 'Gateway IAM Role (SigV4)', description: 'The gateway signs with its execution role — requires the AWS service to sign for' },
+  { value: 'oauth', label: 'OAuth (3LO / 2LO)', description: 'Reference an existing OAuth credential provider by ARN' },
+  { value: 'api_key', label: 'API Key', description: 'Reference an existing API-key credential provider by ARN' },
+];
+
+/**
+ * Available Gateway OAuth grant types for dropdowns.
+ */
+export const GATEWAY_OAUTH_GRANT_TYPES: { value: GatewayOAuthGrantType; label: string; description?: string }[] = [
+  { value: 'authorization_code', label: 'Authorization Code (3LO)', description: 'On-behalf-of-user — requires the user to connect the provider' },
+  { value: 'client_credentials', label: 'Client Credentials (2LO)', description: 'Machine-to-machine — no user consent' },
+  { value: 'token_exchange', label: 'Token Exchange', description: 'Exchange an existing token' },
+];
+
+/**
  * Available tool statuses for dropdowns.
  */
 export const TOOL_STATUSES: { value: ToolStatus; label: string }[] = [
@@ -298,3 +394,30 @@ export const TOOL_STATUSES: { value: ToolStatus; label: string }[] = [
   { value: 'disabled', label: 'Disabled' },
   { value: 'coming_soon', label: 'Coming Soon' },
 ];
+
+/**
+ * Derive the AWS service name for SigV4 signing from a known AWS endpoint host.
+ *
+ * Mirrors the backend `detect_aws_service_from_url`, but returns `''` for an
+ * unrecognised host (so the Gateway form leaves the field for the admin to
+ * fill) rather than defaulting to `'lambda'` — the backend's last-resort
+ * default is only appropriate at signing time.
+ */
+export function detectAwsServiceFromUrl(url: string): string {
+  if (/\.lambda-url\.[a-z0-9-]+\.on\.aws/.test(url)) return 'lambda';
+  if (/\.execute-api\.[a-z0-9-]+\.amazonaws\.com/.test(url)) return 'execute-api';
+  if (/\.bedrock-agentcore\.[a-z0-9-]+\.amazonaws\.com/.test(url)) return 'bedrock-agentcore';
+  return '';
+}
+
+/**
+ * Extract the AWS region from a known AWS endpoint host, or `''` if the host
+ * doesn't encode one. Mirrors the backend `extract_region_from_url`.
+ */
+export function extractAwsRegionFromUrl(url: string): string {
+  const match =
+    url.match(/\.lambda-url\.([a-z0-9-]+)\.on\.aws/) ??
+    url.match(/\.execute-api\.([a-z0-9-]+)\.amazonaws\.com/) ??
+    url.match(/\.bedrock-agentcore\.([a-z0-9-]+)\.amazonaws\.com/);
+  return match ? match[1] : '';
+}
